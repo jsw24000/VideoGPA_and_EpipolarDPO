@@ -1,0 +1,11 @@
+*.safetensors
+*.ckpt
+*.pt
+*.bin
+*.pth
+__pycache__/*.pyc
+output/
+benchmark_videos/
+*.csv
+*.json
+!dl3dv_video_captions/*.json
