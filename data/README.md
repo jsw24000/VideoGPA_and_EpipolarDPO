@@ -172,7 +172,13 @@ VideoGPA and Epipolar-DPO should both read the same canonical condition manifest
 
 ## Git Layout Notes
 
-The root `3DVGM` repository records `VideoGPA/`, `Epipolar-DPO/`, and `third_party/Wan2.2/` as submodules. This avoids mixing nested Git histories into the root repository and keeps large upstream projects reproducible by commit pointer.
+The root `3DVGM` repository tracks `VideoGPA/`, `Epipolar-DPO/`, and `third_party/Wan2.2/` as ordinary directories. This keeps daily work simple: edit any file, then use the normal root-repository flow:
+
+```bash
+git add <changed-files>
+git commit -m "Describe the change"
+git push
+```
 
 Large local artifacts are intentionally ignored by git:
 
@@ -181,9 +187,3 @@ Large local artifacts are intentionally ignored by git:
 - `outputs/`
 - checkpoint and weight files such as `*.safetensors`, `*.pth`, `*.pt`, `*.ckpt`
 - host-local `data/configs/storage.local.yaml`
-
-Local compatibility edits currently present inside the `VideoGPA/` working tree are also saved as a portable patch:
-
-```bash
-git -C VideoGPA apply ../patches/VideoGPA-local-changes.patch
-```
