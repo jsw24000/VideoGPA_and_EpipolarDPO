@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DL3DV caption index record",
+  "type": "object",
+  "required": [
+    "split_group",
+    "source_subset",
+    "scene_uid",
+    "scene_id",
+    "caption_source",
+    "caption_source_file",
+    "caption_source_key",
+    "vlm_caption_raw",
+    "vlm_caption"
+  ],
+  "properties": {
+    "split_group": {"enum": ["train", "test"]},
+    "source_subset": {"enum": ["1K", "8K", "9K", "10K", "11K"]},
+    "scene_uid": {"type": "string"},
+    "scene_id": {"type": "string"},
+    "caption_source": {"type": "string"},
+    "caption_source_file": {"type": "string"},
+    "caption_source_key": {"type": "string"},
+    "caption_image_dir": {"const": "images_8"},
+    "vlm_caption_raw": {"type": "string"},
+    "vlm_caption": {"type": "string", "minLength": 1}
+  },
+  "additionalProperties": true
+}

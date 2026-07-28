@@ -1,0 +1,32 @@
+{
+  "status": "pass",
+  "project_root": "/home/3dsm/Desktop/3DVGM",
+  "asset_root": "/home/3dsm/Desktop/3DVGM/data",
+  "splits": null,
+  "limit": null,
+  "caption_records_all": 4147,
+  "caption_records": 4147,
+  "first_frame_records": 4147,
+  "master_records": 4147,
+  "train_records": 3147,
+  "test_records": 1000,
+  "by_subset": {
+    "8K": 840,
+    "9K": 900,
+    "10K": 909,
+    "11K": 498,
+    "1K": 1000
+  },
+  "export_counts": {
+    "train_i2v": 3147,
+    "train_t2v": 3147,
+    "test_i2v": 1000,
+    "test_t2v": 1000
+  },
+  "missing_first_frames": 0,
+  "error_count": 0,
+  "warning_count": 0,
+  "errors": [],
+  "warnings": [],
+  "truncated_issue_lists": false
+}

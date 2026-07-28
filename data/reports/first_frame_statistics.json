@@ -1,0 +1,25 @@
+{
+  "hf_dataset": "DL3DV/DL3DV-ALL-960P",
+  "hf_dataset_sha": "abb4dab0d4b6d93c32e6d901c06c35bad03210fb",
+  "asset_root": "/home/data1/3dsm/3DVGM_data",
+  "selected_records": 4147,
+  "first_frame_records_total": 4147,
+  "dry_run": false,
+  "resume": true,
+  "keep_download_cache": true,
+  "allow_single_image_dir_fallback": true,
+  "counts": {
+    "skipped_existing": 3,
+    "image_dir_fallback_used": 4144,
+    "extracted": 4144
+  },
+  "selected_by_subset": {
+    "1K": 1000,
+    "8K": 840,
+    "9K": 900,
+    "10K": 909,
+    "11K": 498
+  },
+  "failure_count": 0,
+  "seed_note": "First-frame extraction is independent of seed 2026; prompt seed is handled later."
+}

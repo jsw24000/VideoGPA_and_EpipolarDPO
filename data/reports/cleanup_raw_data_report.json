@@ -1,0 +1,16 @@
+{
+  "dry_run": true,
+  "asset_root": "/tmp/3DVGM_data",
+  "first_frame_records_validated": 3,
+  "target_count": 1,
+  "target_size_bytes": 3082,
+  "free_before": "137.8 GiB",
+  "free_after": "137.8 GiB",
+  "deleted": [
+    {
+      "path": "/tmp/3DVGM_data/staging/first_frame_status",
+      "size_bytes": 3082,
+      "deleted": false
+    }
+  ]
+}

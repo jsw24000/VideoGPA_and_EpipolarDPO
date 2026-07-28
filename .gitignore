@@ -1,0 +1,50 @@
+# Local Python/runtime caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# Local environments and secrets
+.env
+.env.*
+*.pem
+*.key
+*.token
+
+# Large model weights and checkpoints
+models/
+checkpoints/
+**/checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+*.gguf
+
+# Generated media and experiment outputs
+outputs/
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.gif
+
+# Large DL3DV assets kept outside git
+data/first_frames/
+data/dl3dv_raw_960p/
+data/download_cache/
+data/staging/
+
+# Host-local storage config
+data/configs/storage.local.yaml
+
+# Temporary/incomplete downloads
+*.partial
+*.tmp
+*.temp

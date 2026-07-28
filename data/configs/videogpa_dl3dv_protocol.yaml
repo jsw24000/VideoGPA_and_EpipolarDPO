@@ -1,0 +1,31 @@
+train_subsets:
+  - 8K
+  - 9K
+  - 10K
+  - 11K
+
+test_subsets:
+  - 1K
+
+caption_dir: VideoGPA/dl3dv_video_captions
+hf_dataset: DL3DV/DL3DV-ALL-960P
+random_seed: 2026
+
+t2v:
+  train_prompt: natural_vlm_caption
+  test_prompt: natural_vlm_caption
+  append_scripted_camera_motion: false
+
+i2v:
+  train_prompt: official_scripted_camera_prompt
+  test_prompt: natural_vlm_caption
+  first_frame_required: true
+
+outputs:
+  caption_index: data/manifests/caption_index.jsonl
+  first_frames: data/manifests/first_frames.jsonl
+  master_train: data/manifests/master_train.jsonl
+  master_test: data/manifests/master_test.jsonl
+  master_all: data/manifests/master_all.jsonl
+  videogpa_protocol_dir: data/manifests/videogpa_protocol
+  shared_protocol_dir: data/manifests/shared_protocol

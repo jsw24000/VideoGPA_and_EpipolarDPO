@@ -1,0 +1,222 @@
+{
+  "started_at_utc": "2026-07-27T02:43:07.476855+00:00",
+  "project_root": "/home/3dsm/Desktop/3DVGM",
+  "args": {
+    "project_root": null,
+    "scratch_root": "/home/data1/3dsm",
+    "splits": null,
+    "limit": null,
+    "seed": 2026,
+    "resume": true,
+    "dry_run_download": false,
+    "skip_download": false,
+    "cleanup_raw": false,
+    "confirm_cleanup": false,
+    "clear_invalid_proxy_env": false,
+    "repo_id": "DL3DV/DL3DV-ALL-960P",
+    "hf_token": null,
+    "keep_download_cache": true,
+    "retries": 3,
+    "min_free_gb": 1.0
+  },
+  "stages": [
+    {
+      "stage": "storage check",
+      "status": "ok",
+      "details": {
+        "project_root": "/home/3dsm/Desktop/3DVGM",
+        "scratch_root": "/home/data1/3dsm/3DVGM_data",
+        "asset_root": "/home/data1/3dsm/3DVGM_data",
+        "project_free": "137.5 GiB",
+        "external_free": "12.5 TiB"
+      },
+      "error": null,
+      "finished_at_utc": "2026-07-27T02:43:07.498695+00:00"
+    },
+    {
+      "stage": "caption index",
+      "status": "ok",
+      "details": {
+        "caption_dir": "VideoGPA/dl3dv_video_captions",
+        "subsets": {
+          "1K": {
+            "source_file": "VideoGPA/dl3dv_video_captions/captions_1K.json",
+            "json_items": 1000,
+            "indexed_records": 1000,
+            "empty_captions": 0,
+            "invalid_keys": 0,
+            "non_string_captions": 0,
+            "suspicious_captions": 0
+          },
+          "8K": {
+            "source_file": "VideoGPA/dl3dv_video_captions/captions_8K.json",
+            "json_items": 840,
+            "indexed_records": 840,
+            "empty_captions": 0,
+            "invalid_keys": 0,
+            "non_string_captions": 0,
+            "suspicious_captions": 0
+          },
+          "9K": {
+            "source_file": "VideoGPA/dl3dv_video_captions/captions_9K.json",
+            "json_items": 900,
+            "indexed_records": 900,
+            "empty_captions": 0,
+            "invalid_keys": 0,
+            "non_string_captions": 0,
+            "suspicious_captions": 0
+          },
+          "10K": {
+            "source_file": "VideoGPA/dl3dv_video_captions/captions_10K.json",
+            "json_items": 909,
+            "indexed_records": 909,
+            "empty_captions": 0,
+            "invalid_keys": 0,
+            "non_string_captions": 0,
+            "suspicious_captions": 0
+          },
+          "11K": {
+            "source_file": "VideoGPA/dl3dv_video_captions/captions_11K.json",
+            "json_items": 498,
+            "indexed_records": 498,
+            "empty_captions": 0,
+            "invalid_keys": 0,
+            "non_string_captions": 0,
+            "suspicious_captions": 0
+          }
+        },
+        "total_records": 4147,
+        "train_records": 3147,
+        "test_records": 1000,
+        "duplicate_scene_id_count": 0,
+        "train_test_overlap_count": 0,
+        "issue_count": 0,
+        "error_count": 0
+      },
+      "error": null,
+      "finished_at_utc": "2026-07-27T02:43:07.622298+00:00"
+    },
+    {
+      "stage": "first-frame download/extraction",
+      "status": "ok",
+      "details": {
+        "hf_dataset": "DL3DV/DL3DV-ALL-960P",
+        "hf_dataset_sha": "abb4dab0d4b6d93c32e6d901c06c35bad03210fb",
+        "asset_root": "/home/data1/3dsm/3DVGM_data",
+        "selected_records": 4147,
+        "first_frame_records_total": 4147,
+        "dry_run": false,
+        "resume": true,
+        "keep_download_cache": true,
+        "allow_single_image_dir_fallback": true,
+        "counts": {
+          "skipped_existing": 3,
+          "image_dir_fallback_used": 4144,
+          "extracted": 4144
+        },
+        "selected_by_subset": {
+          "1K": 1000,
+          "8K": 840,
+          "9K": 900,
+          "10K": 909,
+          "11K": 498
+        },
+        "failure_count": 0,
+        "seed_note": "First-frame extraction is independent of seed 2026; prompt seed is handled later."
+      },
+      "error": null,
+      "finished_at_utc": "2026-07-28T00:56:56.051664+00:00"
+    },
+    {
+      "stage": "master manifest",
+      "status": "ok",
+      "details": {
+        "seed": 2026,
+        "splits": null,
+        "limit": null,
+        "total_records": 4147,
+        "train_records": 3147,
+        "test_records": 1000,
+        "by_subset": {
+          "8K": 840,
+          "9K": 900,
+          "10K": 909,
+          "11K": 498,
+          "1K": 1000
+        },
+        "first_frame_records": 4147,
+        "missing_first_frames": 0,
+        "missing_first_frame_scene_uids": [],
+        "missing_first_frame_scene_uid_preview_count": 0
+      },
+      "error": null,
+      "finished_at_utc": "2026-07-28T00:56:56.987309+00:00"
+    },
+    {
+      "stage": "prompt JSON export",
+      "status": "ok",
+      "details": {
+        "asset_root": "/home/data1/3dsm/3DVGM_data",
+        "videogpa_protocol_dir": "/home/3dsm/Desktop/3DVGM/data/manifests/videogpa_protocol",
+        "shared_protocol_dir": "/home/3dsm/Desktop/3DVGM/data/manifests/shared_protocol",
+        "counts": {
+          "train_i2v": 3147,
+          "train_t2v": 3147,
+          "test_i2v": 1000,
+          "test_t2v": 1000
+        }
+      },
+      "error": null,
+      "finished_at_utc": "2026-07-28T00:57:04.580313+00:00"
+    },
+    {
+      "stage": "validation",
+      "status": "ok",
+      "details": {
+        "status": "pass",
+        "project_root": "/home/3dsm/Desktop/3DVGM",
+        "asset_root": "/home/data1/3dsm/3DVGM_data",
+        "splits": null,
+        "limit": null,
+        "caption_records_all": 4147,
+        "caption_records": 4147,
+        "first_frame_records": 4147,
+        "master_records": 4147,
+        "train_records": 3147,
+        "test_records": 1000,
+        "by_subset": {
+          "8K": 840,
+          "9K": 900,
+          "10K": 909,
+          "11K": 498,
+          "1K": 1000
+        },
+        "export_counts": {
+          "train_i2v": 3147,
+          "train_t2v": 3147,
+          "test_i2v": 1000,
+          "test_t2v": 1000
+        },
+        "missing_first_frames": 0,
+        "error_count": 0,
+        "warning_count": 0,
+        "errors": [],
+        "warnings": [],
+        "truncated_issue_lists": false
+      },
+      "error": null,
+      "finished_at_utc": "2026-07-28T00:57:19.193877+00:00"
+    },
+    {
+      "stage": "optional raw cleanup",
+      "status": "skipped",
+      "details": {
+        "reason": "not requested"
+      },
+      "error": null,
+      "finished_at_utc": "2026-07-28T00:57:19.194448+00:00"
+    }
+  ],
+  "finished_at_utc": "2026-07-28T00:57:19.196022+00:00",
+  "status": "pass"
+}

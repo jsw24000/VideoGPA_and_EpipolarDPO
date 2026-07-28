@@ -1,0 +1,13 @@
+{
+  "status": "blocked",
+  "reason": "No approved external scratch disk is mounted in this environment.",
+  "automatic_storage_check_command": "python data/scripts/resolve_storage.py",
+  "automatic_storage_check_error": "Could not resolve writable external scratch root. no DL3DV_SCRATCH_ROOT and no writable candidate among /data1, /disk1, /mnt/data1, /mnt/disk1",
+  "policy": "The pipeline must not fall back to the Desktop/project disk for full DL3DV data construction.",
+  "hf_access_verified": true,
+  "hf_dataset": "DL3DV/DL3DV-ALL-960P",
+  "hf_dataset_sha_seen_in_smoke_run": "abb4dab0d4b6d93c32e6d901c06c35bad03210fb",
+  "smoke_run_command": "python data/scripts/build_all_conditions.py --scratch-root /tmp/3DVGM_data --splits 1K --limit 3 --seed 2026 --resume",
+  "smoke_run_status": "pass",
+  "full_run_not_started": true
+}

@@ -1,0 +1,57 @@
+{
+  "caption_dir": "VideoGPA/dl3dv_video_captions",
+  "subsets": {
+    "1K": {
+      "source_file": "VideoGPA/dl3dv_video_captions/captions_1K.json",
+      "json_items": 1000,
+      "indexed_records": 1000,
+      "empty_captions": 0,
+      "invalid_keys": 0,
+      "non_string_captions": 0,
+      "suspicious_captions": 0
+    },
+    "8K": {
+      "source_file": "VideoGPA/dl3dv_video_captions/captions_8K.json",
+      "json_items": 840,
+      "indexed_records": 840,
+      "empty_captions": 0,
+      "invalid_keys": 0,
+      "non_string_captions": 0,
+      "suspicious_captions": 0
+    },
+    "9K": {
+      "source_file": "VideoGPA/dl3dv_video_captions/captions_9K.json",
+      "json_items": 900,
+      "indexed_records": 900,
+      "empty_captions": 0,
+      "invalid_keys": 0,
+      "non_string_captions": 0,
+      "suspicious_captions": 0
+    },
+    "10K": {
+      "source_file": "VideoGPA/dl3dv_video_captions/captions_10K.json",
+      "json_items": 909,
+      "indexed_records": 909,
+      "empty_captions": 0,
+      "invalid_keys": 0,
+      "non_string_captions": 0,
+      "suspicious_captions": 0
+    },
+    "11K": {
+      "source_file": "VideoGPA/dl3dv_video_captions/captions_11K.json",
+      "json_items": 498,
+      "indexed_records": 498,
+      "empty_captions": 0,
+      "invalid_keys": 0,
+      "non_string_captions": 0,
+      "suspicious_captions": 0
+    }
+  },
+  "total_records": 4147,
+  "train_records": 3147,
+  "test_records": 1000,
+  "duplicate_scene_id_count": 0,
+  "train_test_overlap_count": 0,
+  "issue_count": 0,
+  "error_count": 0
+}

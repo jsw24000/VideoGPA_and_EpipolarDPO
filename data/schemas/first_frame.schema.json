@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DL3DV first-frame index record",
+  "type": "object",
+  "required": [
+    "record_version",
+    "scene_uid",
+    "split_group",
+    "source_subset",
+    "scene_id",
+    "first_frame_relpath",
+    "first_frame_sha256",
+    "first_frame_width",
+    "first_frame_height",
+    "hf_dataset",
+    "hf_file",
+    "zip_member"
+  ],
+  "properties": {
+    "record_version": {"const": 1},
+    "scene_uid": {"type": "string"},
+    "split_group": {"enum": ["train", "test"]},
+    "source_subset": {"enum": ["1K", "8K", "9K", "10K", "11K"]},
+    "scene_id": {"type": "string"},
+    "first_frame_relpath": {"type": "string"},
+    "first_frame_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "first_frame_width": {"type": "integer", "minimum": 1},
+    "first_frame_height": {"type": "integer", "minimum": 1},
+    "first_frame_size_bytes": {"type": "integer", "minimum": 1},
+    "hf_dataset": {"type": "string"},
+    "hf_file": {"type": "string"},
+    "zip_member": {"type": "string"}
+  },
+  "additionalProperties": true
+}
