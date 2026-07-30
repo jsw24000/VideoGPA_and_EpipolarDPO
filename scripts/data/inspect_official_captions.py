@@ -18,6 +18,7 @@ from dl3dv_conditions.common import (
     write_json,
     write_jsonl,
 )
+from vgm_common.paths import activate_profile, get_manifest_root, get_validation_root
 
 
 def _issue(issue_type: str, subset: str, key: str | None, message: str, severity: str = "warning") -> dict[str, Any]:
@@ -150,16 +151,27 @@ def inspect_captions(project_root: Path, caption_dir: Path | None = None) -> tup
 def main() -> int:
     parser = argparse.ArgumentParser(description="Inspect official VideoGPA DL3DV captions and build caption_index.jsonl.")
     parser.add_argument("--project-root", default=None)
+    parser.add_argument("--profile", default=None)
+    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--caption-dir", default=None)
     args = parser.parse_args()
 
     try:
+        if args.profile:
+            activate_profile(args.profile)
         project_root = find_project_root(Path(args.project_root).resolve() if args.project_root else None)
-        caption_dir = Path(args.caption_dir).resolve() if args.caption_dir else None
+        caption_dir = Path(args.caption_dir).expanduser() if args.caption_dir else None
+        if caption_dir and not caption_dir.is_absolute():
+            caption_dir = project_root / caption_dir
+        if args.dry_run:
+            print(f"caption_dir: {caption_dir or project_root / 'VideoGPA' / 'dl3dv_video_captions'}")
+            print(f"caption_index: {get_manifest_root() / 'caption_index.jsonl'}")
+            print(f"reports_dir: {get_validation_root() / 'reports'}")
+            return 0
         records, stats, issues = inspect_captions(project_root, caption_dir)
-        write_json(project_root / "data" / "reports" / "caption_statistics.json", stats)
-        write_jsonl(project_root / "data" / "reports" / "caption_issues.jsonl", issues)
-        write_jsonl(project_root / "data" / "manifests" / "caption_index.jsonl", records)
+        write_json(get_validation_root() / "reports" / "caption_statistics.json", stats)
+        write_jsonl(get_validation_root() / "reports" / "caption_issues.jsonl", issues)
+        write_jsonl(get_manifest_root() / "caption_index.jsonl", records)
         print(f"indexed_records: {stats['total_records']}")
         print(f"train_records: {stats['train_records']}")
         print(f"test_records: {stats['test_records']}")

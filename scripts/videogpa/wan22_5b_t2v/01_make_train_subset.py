@@ -6,7 +6,9 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from common import deterministic_sample, read_json, resolve_config, safe_id, sha256_file, write_json, write_yaml
+from common import deterministic_sample, read_json, resolve_config, safe_id, sha256_file, write_json
+from vgm_common.config import write_resolved_config
+from vgm_common.paths import get_manifest_root
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -64,7 +66,7 @@ def main() -> None:
     if not isinstance(manifest, dict):
         raise ValueError("train_t2v manifest must be a dict")
 
-    master_rows = load_jsonl(project_root / "data/manifests/master_all.jsonl")
+    master_rows = load_jsonl(get_manifest_root() / "master_all.jsonl")
     master_by_uid = {row.get("scene_uid"): row for row in master_rows}
 
     candidates = []
@@ -127,7 +129,7 @@ def main() -> None:
     }
     out_path = run_dir / "manifests/input_subset.json"
     write_json(out_path, out)
-    write_yaml(run_dir / "config/resolved_config.yaml", cfg)
+    write_resolved_config(run_dir, cfg)
     print(f"Wrote {out_path}")
     print(f"Selected {len(selected)} train T2V scenes across buckets {counts_by_bucket}")
     if len(selected) < 2:

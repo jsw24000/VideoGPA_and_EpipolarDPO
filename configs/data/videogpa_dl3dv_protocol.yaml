@@ -22,10 +22,10 @@ i2v:
   first_frame_required: true
 
 outputs:
-  caption_index: data/manifests/caption_index.jsonl
-  first_frames: data/manifests/first_frames.jsonl
-  master_train: data/manifests/master_train.jsonl
-  master_test: data/manifests/master_test.jsonl
-  master_all: data/manifests/master_all.jsonl
-  videogpa_protocol_dir: data/manifests/videogpa_protocol
-  shared_protocol_dir: data/manifests/shared_protocol
+  caption_index_relpath: caption_index.jsonl
+  first_frames_relpath: first_frames.jsonl
+  master_train_relpath: master_train.jsonl
+  master_test_relpath: master_test.jsonl
+  master_all_relpath: master_all.jsonl
+  videogpa_protocol_relpath: videogpa_protocol
+  shared_protocol_relpath: shared_protocol

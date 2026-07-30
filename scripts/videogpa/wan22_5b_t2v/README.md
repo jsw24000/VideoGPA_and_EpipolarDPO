@@ -1,10 +1,11 @@
 # WAN2.2 5B T2V VideoGPA Smoke Scripts
 
 This is the runnable smoke harness for the pure T2V sibling of the official
-VideoGPA `Wan2.2-TI2V-5B` chain. It writes only under:
+VideoGPA `Wan2.2-TI2V-5B` chain. Activate a path profile first; the smoke YAML
+then resolves `experiment.output_subdir` under `VGM_OUTPUT_ROOT`:
 
 ```text
-outputs/videogpa/wan2.2-5b/t2v/smoke/<run_id>/
+$VGM_OUTPUT_ROOT/videogpa/wan22_5b_t2v/smoke/<run_id>/
 ```
 
 It never writes generated videos, latents, or checkpoints into `VideoGPA/data`,
@@ -15,6 +16,7 @@ It never writes generated videos, latents, or checkpoints into `VideoGPA/data`,
 Run only preflight and static checks:
 
 ```bash
+source scripts/env/activate_profile.sh local
 VIDEOGPA_CONDA_ENV=wan22_videogpa \
 bash scripts/videogpa/wan22_5b_t2v/run_smoke.sh --stop-after static_checks
 ```
@@ -22,15 +24,17 @@ bash scripts/videogpa/wan22_5b_t2v/run_smoke.sh --stop-after static_checks
 Run only preflight:
 
 ```bash
+source scripts/env/activate_profile.sh local
 VIDEOGPA_CONDA_ENV=wan22_videogpa \
 bash scripts/videogpa/wan22_5b_t2v/run_smoke.sh --stop-after preflight
 ```
 
 ## Full Smoke
 
-Run from the project root:
+Run from any working directory after activating a profile:
 
 ```bash
+source scripts/env/activate_profile.sh local
 VIDEOGPA_CONDA_ENV=wan22_videogpa bash scripts/videogpa/wan22_5b_t2v/run_smoke.sh
 ```
 
@@ -42,13 +46,13 @@ bash scripts/videogpa/wan22_5b_t2v/run_smoke.sh --stop-after preflight
 bash scripts/videogpa/wan22_5b_t2v/run_smoke.sh --force-stage generation_candidates --run-id <run_id>
 ```
 
-Important environment overrides:
+Important path environment variables come from the active profile:
 
 ```bash
-PROJECT_ROOT=/path/to/3DVGM
-WAN22_5B_MODEL_PATH=/path/to/Wan2.2-TI2V-5B
-VGGT_MODEL_PATH=/path/to/VGGT-1B
-VIDEOGPA_OUTPUT_ROOT=/path/to/output/root
+VGM_REPO_ROOT=<repo>
+VGM_DL3DV_ROOT=<dl3dv root>
+VGM_MODEL_ROOT=<model root>
+VGM_OUTPUT_ROOT=<output root>
 HF_HOME=/path/to/hf/cache
 ```
 
@@ -67,7 +71,7 @@ HF_HOME=/path/to/hf/cache
 For strict scoring without debug fallback:
 
 ```bash
-RUN_DIR=outputs/videogpa/wan2.2-5b/t2v/smoke/<run_id> \
+RUN_DIR=$VGM_OUTPUT_ROOT/videogpa/wan22_5b_t2v/smoke/<run_id> \
 DISABLE_DEBUG_FALLBACK=1 \
 bash scripts/videogpa/wan22_5b_t2v/03_score_preferences.sh
 ```
@@ -83,15 +87,15 @@ configs/videogpa/wan22_5b_t2v_formal.yaml
 Formal output root:
 
 ```text
-outputs/videogpa/wan2.2-5b/t2v/formal/<run_id>/
+$VGM_OUTPUT_ROOT/videogpa/wan22_5b_t2v/formal/<run_id>/
 ```
 
 The formal selector reads only:
 
 ```text
-data/manifests/videogpa_protocol/train_t2v.json
-data/manifests/master_all.jsonl
-data/manifests/caption_index.jsonl
+$VGM_MANIFEST_ROOT/videogpa_protocol/train_t2v.json
+$VGM_MANIFEST_ROOT/master_all.jsonl
+$VGM_MANIFEST_ROOT/caption_index.jsonl
 ```
 
 It selects all train T2V scenes from buckets `8K`, `9K`, `10K`, and `11K` by default. It does not read `test_t2v.json`, `test_i2v.json`, `train_i2v.json`, or first-frame files.
@@ -99,6 +103,7 @@ It selects all train T2V scenes from buckets `8K`, `9K`, `10K`, and `11K` by def
 Run only formal preflight/static checks:
 
 ```bash
+source scripts/env/activate_profile.sh local
 VIDEOGPA_CONDA_ENV=wan22_videogpa \
 bash scripts/videogpa/wan22_5b_t2v/run_formal.sh --stop-after static_checks
 ```
@@ -106,6 +111,7 @@ bash scripts/videogpa/wan22_5b_t2v/run_formal.sh --stop-after static_checks
 Run formal through candidate generation only:
 
 ```bash
+source scripts/env/activate_profile.sh local
 GPU_ID=1 \
 VIDEOGPA_CONDA_ENV=wan22_videogpa \
 bash scripts/videogpa/wan22_5b_t2v/run_formal.sh --stop-after generation_candidates
@@ -114,6 +120,7 @@ bash scripts/videogpa/wan22_5b_t2v/run_formal.sh --stop-after generation_candida
 Run full formal chain:
 
 ```bash
+source scripts/env/activate_profile.sh local
 GPU_ID=1 \
 VIDEOGPA_CONDA_ENV=wan22_videogpa \
 bash scripts/videogpa/wan22_5b_t2v/run_formal.sh
@@ -122,6 +129,7 @@ bash scripts/videogpa/wan22_5b_t2v/run_formal.sh
 Resume a formal run:
 
 ```bash
+source scripts/env/activate_profile.sh local
 GPU_ID=1 \
 VIDEOGPA_CONDA_ENV=wan22_videogpa \
 bash scripts/videogpa/wan22_5b_t2v/run_formal.sh --resume --run-id <run_id>
@@ -151,8 +159,8 @@ decord
 lpips
 easydict
 ffmpeg and ffprobe on PATH
-local Wan2.2-TI2V-5B weights
-local VGGT-1B weights
+Wan2.2-TI2V-5B weights under VGM_MODEL_ROOT
+VGGT-1B weights under VGM_MODEL_ROOT
 ```
 
 With the current `transformers==4.51.3`, `huggingface-hub` must satisfy:
@@ -170,10 +178,10 @@ conda run -n wan22_videogpa python -m pip install 'huggingface-hub>=0.30.0,<1.0'
 LoRA checkpoints are written under:
 
 ```text
-outputs/videogpa/wan2.2-5b/t2v/formal/<run_id>/checkpoints/step_001000/
-outputs/videogpa/wan2.2-5b/t2v/formal/<run_id>/checkpoints/step_002000/
+$VGM_OUTPUT_ROOT/videogpa/wan22_5b_t2v/formal/<run_id>/checkpoints/step_001000/
+$VGM_OUTPUT_ROOT/videogpa/wan22_5b_t2v/formal/<run_id>/checkpoints/step_002000/
 ...
-outputs/videogpa/wan2.2-5b/t2v/formal/<run_id>/checkpoints/step_010000/
+$VGM_OUTPUT_ROOT/videogpa/wan22_5b_t2v/formal/<run_id>/checkpoints/step_010000/
 ```
 
-Each checkpoint contains `adapter_config.json`, `adapter_model.safetensors`, optimizer/scheduler state, trainer state, and `resolved_config.yaml`.
+Each run contains top-level `config_resolved.yaml`, `command.txt`, `environment.txt`, `git_state.txt`, and checkpoint artifacts under `checkpoints/`.

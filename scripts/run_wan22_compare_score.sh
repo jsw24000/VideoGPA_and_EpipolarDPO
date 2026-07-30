@@ -6,11 +6,13 @@ log() {
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/env/require_profile.sh"
+vgm_require_profile
 
 ENV_NAME="${ENV_NAME:-wan22_videogpa}"
-VIDEOGPA_DIR="${VIDEOGPA_DIR:-${PROJECT_ROOT}/VideoGPA}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_ROOT}/outputs/wan22_compare}"
+VIDEOGPA_DIR="${VIDEOGPA_DIR:-${VGM_REPO_ROOT}/VideoGPA}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${VGM_OUTPUT_ROOT}/evaluation/wan22_compare}"
 
 SEED="${SEED:-42}"
 FRAME_NUM="${FRAME_NUM:-81}"
@@ -28,7 +30,7 @@ LOG_DIR="${RUN_ROOT}/logs"
 SCORE_DEVICES="${SCORE_DEVICES:-0}"
 SCORE_NUM_FRAMES="${SCORE_NUM_FRAMES:-10}"
 SCORE_BACKBONE="${SCORE_BACKBONE:-vggt}"
-SCORE_MODEL_NAME="${SCORE_MODEL_NAME:-${PROJECT_ROOT}/models/vggt/VGGT-1B}"
+SCORE_MODEL_NAME="${SCORE_MODEL_NAME:-${VGM_MODEL_ROOT}/vggt/VGGT-1B}"
 SCORE_DESCRIPTOR_TYPE="${SCORE_DESCRIPTOR_TYPE:-sift}"
 INSTALL_SCORE_DEPS="${INSTALL_SCORE_DEPS:-0}"
 

@@ -6,15 +6,17 @@ log() {
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/env/require_profile.sh"
+vgm_require_profile
 
 ENV_NAME="${ENV_NAME:-wan22_videogpa}"
 PHYSICAL_GPU_ID="${GPU_ID:-0}"
-VIDEOGPA_DIR="${VIDEOGPA_DIR:-${PROJECT_ROOT}/VideoGPA}"
-MODEL_PATH="${MODEL_PATH:-${PROJECT_ROOT}/models/wan/Wan2.2-TI2V-5B}"
-PROMPT_JSON="${PROMPT_JSON:-${PROJECT_ROOT}/outputs/dl3dv_miniset/prompts_30_camera_motion.json}"
-LORA_PATH="${LORA_PATH:-${VIDEOGPA_DIR}/checkpoints/VideoGPA-Wan2.2TI2V-lora}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_ROOT}/outputs/wan22_compare}"
+VIDEOGPA_DIR="${VIDEOGPA_DIR:-${VGM_REPO_ROOT}/VideoGPA}"
+MODEL_PATH="${MODEL_PATH:-${VGM_MODEL_ROOT}/wan/Wan2.2-TI2V-5B}"
+PROMPT_JSON="${PROMPT_JSON:-${VGM_OUTPUT_ROOT}/dl3dv_miniset/prompts_30_camera_motion.json}"
+LORA_PATH="${LORA_PATH:-${VGM_MODEL_ROOT}/videogpa/VideoGPA-Wan2.2TI2V-lora}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${VGM_OUTPUT_ROOT}/evaluation/wan22_compare}"
 
 SEED="${SEED:-42}"
 FRAME_NUM="${FRAME_NUM:-81}"

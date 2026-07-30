@@ -6,12 +6,14 @@ log() {
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/env/require_profile.sh"
+vgm_require_profile
 ENV_NAME="${ENV_NAME:-wan22_videogpa}"
 GPU_ID="${GPU_ID:-0}"
-OUTPUT_ROOT="${PROJECT_ROOT}/outputs/wan22_smoke"
-WAN_SRC_DIR="${WAN_SRC_DIR:-${PROJECT_ROOT}/third_party/Wan2.2}"
-MODEL_DIR="${MODEL_DIR:-${PROJECT_ROOT}/models/wan/Wan2.2-TI2V-5B}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${VGM_OUTPUT_ROOT}/videogpa/wan22_5b_i2v/smoke}"
+WAN_SRC_DIR="${WAN_SRC_DIR:-${VGM_REPO_ROOT}/third_party/Wan2.2}"
+MODEL_DIR="${MODEL_DIR:-${VGM_MODEL_ROOT}/wan/Wan2.2-TI2V-5B}"
 
 PROMPT="${PROMPT:-The camera slowly moves forward through the scene while the geometry and object shapes remain stable.}"
 SIZE="${SIZE:-1280*704}"

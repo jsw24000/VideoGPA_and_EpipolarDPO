@@ -6,11 +6,13 @@ log() {
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/env/require_profile.sh"
+vgm_require_profile
 ENV_NAME="${ENV_NAME:-wan22_videogpa}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.10}"
-OUTPUT_DIR="${PROJECT_ROOT}/outputs/wan22_smoke"
-WAN_SRC_DIR="${WAN_SRC_DIR:-${PROJECT_ROOT}/third_party/Wan2.2}"
+OUTPUT_DIR="${OUTPUT_DIR:-${VGM_OUTPUT_ROOT}/wan22_smoke}"
+WAN_SRC_DIR="${WAN_SRC_DIR:-${VGM_REPO_ROOT}/third_party/Wan2.2}"
 WAN_REPO_URL="${WAN_REPO_URL:-https://github.com/Wan-Video/Wan2.2.git}"
 
 TORCH_VERSION="${TORCH_VERSION:-2.8.0+cu128}"
@@ -90,12 +92,12 @@ else
   log "Reusing existing Wan2.2 source at ${WAN_SRC_DIR}"
 fi
 
-if [ -d "${PROJECT_ROOT}/VideoGPA" ]; then
-  if [ -e "${PROJECT_ROOT}/VideoGPA/Wan2.2" ] && [ ! -L "${PROJECT_ROOT}/VideoGPA/Wan2.2" ]; then
+if [ -d "${VGM_REPO_ROOT}/VideoGPA" ]; then
+  if [ -e "${VGM_REPO_ROOT}/VideoGPA/Wan2.2" ] && [ ! -L "${VGM_REPO_ROOT}/VideoGPA/Wan2.2" ]; then
     log "VideoGPA/Wan2.2 exists and is not a symlink; leaving it untouched."
   else
     log "Ensuring VideoGPA/Wan2.2 points to ../third_party/Wan2.2"
-    ln -sfn ../third_party/Wan2.2 "${PROJECT_ROOT}/VideoGPA/Wan2.2"
+    ln -sfn ../third_party/Wan2.2 "${VGM_REPO_ROOT}/VideoGPA/Wan2.2"
   fi
 fi
 

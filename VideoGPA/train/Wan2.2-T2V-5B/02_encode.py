@@ -27,10 +27,13 @@ VIDEOGPA_ROOT = CURRENT_DIR.parents[1]
 PROJECT_ROOT = VIDEOGPA_ROOT.parent
 TRAIN_DIR = VIDEOGPA_ROOT / "train"
 WAN_PATH = VIDEOGPA_ROOT / "Wan2.2"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 for path in [TRAIN_DIR, VIDEOGPA_ROOT, WAN_PATH]:
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
+from vgm_common.config import resolve_experiment_config, write_resolved_config  # noqa: E402
 from wan.configs import WAN_CONFIGS  # noqa: E402
 from wan.modules.t5 import T5EncoderModel  # noqa: E402
 from wan.modules.vae2_2 import Wan2_2_VAE  # noqa: E402
@@ -108,25 +111,11 @@ def find_unique_wan_model(models_root: Path) -> Path:
 
 
 def resolve_config(config_path: Path | None, run_dir: Path, model_path: str | None) -> dict[str, Any]:
-    cfg: dict[str, Any] = {}
-    if config_path:
-        cfg = read_yaml(config_path)
-    cfg.setdefault("project", {})
-    cfg.setdefault("paths", {})
+    if config_path is None:
+        raise ValueError("--config is required so paths can be resolved through the active VGM profile")
+    cfg = resolve_experiment_config(config_path, run_dir, model_path_override=model_path)
     cfg.setdefault("encoding", {})
-    project_root = Path(os.environ.get("PROJECT_ROOT", PROJECT_ROOT)).expanduser().resolve()
-    cfg["project"]["project_root"] = str(project_root)
     cfg["project"]["task"] = "t2v"
-    cfg["paths"]["run_dir"] = str(run_dir.resolve())
-    cfg["paths"]["videogpa_root"] = str(resolve_path(project_root, cfg["paths"].get("videogpa_root", "VideoGPA")))
-    if model_path:
-        cfg["paths"]["wan_model_path"] = str(resolve_path(project_root, model_path))
-    elif os.environ.get("WAN22_5B_MODEL_PATH"):
-        cfg["paths"]["wan_model_path"] = str(resolve_path(project_root, os.environ["WAN22_5B_MODEL_PATH"]))
-    elif cfg["paths"].get("wan_model_path", "auto") == "auto":
-        cfg["paths"]["wan_model_path"] = str(find_unique_wan_model(project_root / "models"))
-    else:
-        cfg["paths"]["wan_model_path"] = str(resolve_path(project_root, cfg["paths"]["wan_model_path"]))
     return cfg
 
 
@@ -205,7 +194,7 @@ def load_pairs(input_path: Path) -> list[dict[str, Any]]:
 
 def encode(args: argparse.Namespace) -> None:
     run_dir = Path(args.run_dir).expanduser().resolve()
-    cfg = resolve_config(Path(args.config).expanduser().resolve() if args.config else None, run_dir, args.model_path)
+    cfg = resolve_config(args.config if args.config else None, run_dir, args.model_path)
     assert cfg["project"].get("task") == "t2v"
     model_path = Path(cfg["paths"]["wan_model_path"]).resolve()
     input_json = Path(args.input_json or run_dir / "manifests/preference_pairs.json").expanduser().resolve()
@@ -361,7 +350,7 @@ def encode(args: argparse.Namespace) -> None:
         "groups": groups_for_dataset,
     }
     write_json(output_json, payload)
-    write_yaml(run_dir / "config/resolved_config.yaml", cfg)
+    write_resolved_config(run_dir, cfg)
     print(f"Wrote encoded manifest: {output_json}")
 
 

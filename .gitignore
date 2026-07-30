@@ -15,7 +15,9 @@ __pycache__/
 *.token
 
 # Large model weights and checkpoints
-/models/
+/models/*
+!/models/README.md
+!/models/.gitkeep
 /checkpoints/
 **/checkpoints/
 *.ckpt
@@ -27,7 +29,9 @@ __pycache__/
 *.gguf
 
 # Generated media and experiment outputs
-/outputs/
+/outputs/*
+!/outputs/README.md
+!/outputs/.gitkeep
 *.mp4
 *.mov
 *.avi
@@ -36,12 +40,26 @@ __pycache__/
 *.gif
 
 # Large DL3DV assets kept outside git
-/data/first_frames/
+/data/first_frames/*
+!/data/first_frames/.gitkeep
+/data/manifests/*
+!/data/manifests/.gitkeep
+/data/logs/*
+!/data/logs/.gitkeep
+/data/reports/generated/*
+!/data/reports/generated/.gitkeep
+/data/reports/*.json
+/data/reports/*.jsonl
+/data/reports/*.md
+!/data/reports/README.md
+/data/validation/*
+!/data/validation/.gitkeep
 /data/dl3dv_raw_960p/
 /data/download_cache/
 /data/staging/
 
 # Host-local storage config
+/configs/data/storage.local.yaml
 /data/configs/storage.local.yaml
 
 # Temporary/incomplete downloads

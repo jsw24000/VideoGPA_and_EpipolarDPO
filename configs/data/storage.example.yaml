@@ -1,14 +1,12 @@
-# Copy this structure to storage.local.yaml by running:
-#   python data/scripts/resolve_storage.py --scratch-root /data1/3DVGM_data
+# Profile-driven storage is preferred:
+#   source scripts/env/activate_profile.sh local
+#   python scripts/env/check_paths.py
 #
-# Canonical manifests store first-frame paths relative to asset_root.
-# On a new server, regenerate storage.local.yaml or pass --asset-root to export/validate.
-project_root: /path/to/3DVGM
-project_data: /path/to/3DVGM/data
-scratch_root: /external/disk/3DVGM_data
-asset_root: /external/disk/3DVGM_data
-dl3dv_raw_960p: /external/disk/3DVGM_data/dl3dv_raw_960p
-first_frames: /external/disk/3DVGM_data/first_frames
-download_cache: /external/disk/3DVGM_data/download_cache
-staging: /external/disk/3DVGM_data/staging
-canonical_paths: relative_to_asset_root
+# Canonical manifests store paths relative to VGM_DL3DV_ROOT.
+profile: local
+archives_relroot: archives
+extracted_relroot: extracted
+manifests_relroot: manifests
+first_frames_relroot: first_frames
+validation_relroot: validation
+canonical_paths: relative_to_vgm_dl3dv_root

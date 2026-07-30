@@ -15,10 +15,8 @@ import os
 import sys
 from pathlib import Path
 
-import lpips
-import torch
-
 from common import read_json, resolve_config, safe_id, write_json
+from vgm_common.paths import get_model_root
 
 
 def add_videogpa_paths(project_root: Path) -> None:
@@ -123,7 +121,7 @@ def main() -> None:
     add_videogpa_paths(project_root)
     vggt_path = Path(cfg["paths"]["vggt_model_path"]).resolve()
     if not vggt_path.exists():
-        raise FileNotFoundError(f"Local VGGT model path does not exist: {vggt_path}")
+        raise FileNotFoundError(f"VGGT model path does not exist: {vggt_path}")
 
     from metrics.consistency_score import Consistency_Score
     from pipelines.process_video import VideoProcessor
@@ -138,10 +136,13 @@ def main() -> None:
     if not groups:
         raise RuntimeError(f"No groups found in {input_json}")
 
+    import lpips
+    import torch
+
     device = torch.device(f"cuda:{int(cfg['training'].get('device', 0))}" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         torch.cuda.set_device(device)
-    os.environ.setdefault("HF_HOME", str(project_root / "models/.hf_cache"))
+    os.environ.setdefault("HF_HOME", str(get_model_root() / ".hf_cache"))
     lpips_net = lpips.LPIPS(net="vgg").to(device).eval()
     metrics = {"Consistency_Score": Consistency_Score(lpips_net, device=device)}
     processor = VideoProcessor(metrics=metrics, model_name=str(vggt_path), device=device)

@@ -19,9 +19,12 @@ CURRENT_DIR = Path(__file__).resolve().parent
 VIDEOGPA_ROOT = CURRENT_DIR.parent
 PROJECT_ROOT = VIDEOGPA_ROOT.parent
 WAN_PATH = VIDEOGPA_ROOT / "Wan2.2"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 if str(WAN_PATH) not in sys.path:
     sys.path.insert(0, str(WAN_PATH))
 
+from vgm_common.config import resolve_experiment_config, write_resolved_config  # noqa: E402
 from wan.configs import SIZE_CONFIGS, WAN_CONFIGS  # noqa: E402
 from wan.textimage2video import WanTI2V  # noqa: E402
 
@@ -100,27 +103,12 @@ def find_unique_model_dir(models_root: Path) -> Path:
 
 
 def resolve_config(config_path: Path | None, run_dir: Path | None, model_path: str | None) -> dict[str, Any]:
-    cfg: dict[str, Any] = {}
-    if config_path:
-        cfg = read_yaml(config_path)
-    cfg.setdefault("project", {})
-    cfg.setdefault("paths", {})
+    if config_path is None:
+        raise ValueError("--config is required so paths can be resolved through the active VGM profile")
+    cfg = resolve_experiment_config(config_path, run_dir, model_path_override=model_path)
     cfg.setdefault("generation", {})
     cfg.setdefault("data", {})
-    project_root = Path(os.environ.get("PROJECT_ROOT", PROJECT_ROOT)).expanduser().resolve()
-    cfg["project"]["project_root"] = str(project_root)
     cfg["project"]["task"] = "t2v"
-    if run_dir:
-        cfg["paths"]["run_dir"] = str(resolve_path(project_root, run_dir))
-    cfg["paths"]["videogpa_root"] = str(resolve_path(project_root, cfg["paths"].get("videogpa_root", "VideoGPA")))
-    if model_path:
-        cfg["paths"]["wan_model_path"] = str(resolve_path(project_root, model_path))
-    elif os.environ.get("WAN22_5B_MODEL_PATH"):
-        cfg["paths"]["wan_model_path"] = str(resolve_path(project_root, os.environ["WAN22_5B_MODEL_PATH"]))
-    elif cfg["paths"].get("wan_model_path", "auto") == "auto":
-        cfg["paths"]["wan_model_path"] = str(find_unique_model_dir(project_root / "models"))
-    else:
-        cfg["paths"]["wan_model_path"] = str(resolve_path(project_root, cfg["paths"]["wan_model_path"]))
     return cfg
 
 
@@ -291,7 +279,7 @@ def mount_lora(engine: WanTI2V, lora_path: Path | None, lora_weight: float) -> b
 
 def generate(args: argparse.Namespace) -> None:
     cfg = resolve_config(
-        Path(args.config).expanduser().resolve() if args.config else None,
+        args.config if args.config else None,
         Path(args.run_dir).expanduser().resolve() if args.run_dir else None,
         args.model_path,
     )
@@ -460,7 +448,7 @@ def generate(args: argparse.Namespace) -> None:
     }
     write_json(output_manifest, payload)
     write_json(output_manifest.parent / "generation_args.json", payload["generation_args"])
-    write_yaml(run_dir / "config/resolved_config.yaml", cfg)
+    write_resolved_config(run_dir, cfg)
     print(f"Wrote candidate manifest: {output_manifest}")
 
 

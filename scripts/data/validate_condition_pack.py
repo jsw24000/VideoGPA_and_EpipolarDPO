@@ -23,6 +23,7 @@ from dl3dv_conditions.common import (
     write_json,
     write_jsonl,
 )
+from vgm_common.paths import activate_profile, get_manifest_root, get_validation_root
 
 
 def _err(errors: list[dict[str, Any]], issue_type: str, message: str, scene_uid: str | None = None, field: str | None = None) -> None:
@@ -38,60 +39,69 @@ def _load_json(path: Path) -> Any:
         return json.load(handle)
 
 
+def display_path(path: Path, project_root: Path) -> str:
+    try:
+        return str(path.relative_to(project_root))
+    except ValueError:
+        return str(path)
+
+
 def validate_json_reload(project_root: Path, errors: list[dict[str, Any]]) -> None:
+    manifest_dir = get_manifest_root()
+    reports_dir = get_validation_root() / "reports"
     json_files = [
-        project_root / "data" / "reports" / "caption_statistics.json",
-        project_root / "data" / "reports" / "first_frame_statistics.json",
-        project_root / "data" / "reports" / "manifest_statistics.json",
-        project_root / "data" / "reports" / "export_statistics.json",
-        project_root / "data" / "manifests" / "videogpa_protocol" / "train_i2v.json",
-        project_root / "data" / "manifests" / "videogpa_protocol" / "train_t2v.json",
-        project_root / "data" / "manifests" / "videogpa_protocol" / "test_i2v.json",
-        project_root / "data" / "manifests" / "videogpa_protocol" / "test_t2v.json",
+        reports_dir / "caption_statistics.json",
+        reports_dir / "first_frame_statistics.json",
+        reports_dir / "manifest_statistics.json",
+        reports_dir / "export_statistics.json",
+        manifest_dir / "videogpa_protocol" / "train_i2v.json",
+        manifest_dir / "videogpa_protocol" / "train_t2v.json",
+        manifest_dir / "videogpa_protocol" / "test_i2v.json",
+        manifest_dir / "videogpa_protocol" / "test_t2v.json",
     ]
     jsonl_files = [
-        project_root / "data" / "manifests" / "caption_index.jsonl",
-        project_root / "data" / "manifests" / "first_frames.jsonl",
-        project_root / "data" / "manifests" / "master_train.jsonl",
-        project_root / "data" / "manifests" / "master_test.jsonl",
-        project_root / "data" / "manifests" / "master_all.jsonl",
-        project_root / "data" / "manifests" / "shared_protocol" / "train_i2v.jsonl",
-        project_root / "data" / "manifests" / "shared_protocol" / "train_t2v.jsonl",
-        project_root / "data" / "manifests" / "shared_protocol" / "test_i2v.jsonl",
-        project_root / "data" / "manifests" / "shared_protocol" / "test_t2v.jsonl",
+        manifest_dir / "caption_index.jsonl",
+        manifest_dir / "first_frames.jsonl",
+        manifest_dir / "master_train.jsonl",
+        manifest_dir / "master_test.jsonl",
+        manifest_dir / "master_all.jsonl",
+        manifest_dir / "shared_protocol" / "train_i2v.jsonl",
+        manifest_dir / "shared_protocol" / "train_t2v.jsonl",
+        manifest_dir / "shared_protocol" / "test_i2v.jsonl",
+        manifest_dir / "shared_protocol" / "test_t2v.jsonl",
     ]
     for path in json_files:
         if not path.exists():
-            _err(errors, "missing_json_file", f"Missing JSON output: {path.relative_to(project_root)}")
+            _err(errors, "missing_json_file", f"Missing JSON output: {display_path(path, project_root)}")
             continue
         try:
             _load_json(path)
         except Exception as exc:
-            _err(errors, "invalid_json_file", f"{path.relative_to(project_root)} cannot be reloaded: {exc}")
+            _err(errors, "invalid_json_file", f"{display_path(path, project_root)} cannot be reloaded: {exc}")
     for path in jsonl_files:
         if not path.exists():
-            _err(errors, "missing_jsonl_file", f"Missing JSONL output: {path.relative_to(project_root)}")
+            _err(errors, "missing_jsonl_file", f"Missing JSONL output: {display_path(path, project_root)}")
             continue
         try:
             read_jsonl(path)
         except Exception as exc:
-            _err(errors, "invalid_jsonl_file", f"{path.relative_to(project_root)} cannot be reloaded: {exc}")
+            _err(errors, "invalid_jsonl_file", f"{display_path(path, project_root)} cannot be reloaded: {exc}")
 
 
 def validate_exports(project_root: Path, asset_root: Path, errors: list[dict[str, Any]]) -> dict[str, int]:
-    protocol_dir = project_root / "data" / "manifests" / "videogpa_protocol"
+    protocol_dir = get_manifest_root() / "videogpa_protocol"
     counts: dict[str, int] = {}
     exports: dict[str, dict[str, Any]] = {}
     for name in ("train_i2v", "train_t2v", "test_i2v", "test_t2v"):
         path = protocol_dir / f"{name}.json"
         if not path.exists():
-            _err(errors, "missing_export", f"Missing VideoGPA export: {path.relative_to(project_root)}")
+            _err(errors, "missing_export", f"Missing VideoGPA export: {display_path(path, project_root)}")
             counts[name] = 0
             exports[name] = {}
             continue
         data = _load_json(path)
         if not isinstance(data, dict):
-            _err(errors, "invalid_export_root", f"Export root must be object: {path.relative_to(project_root)}")
+            _err(errors, "invalid_export_root", f"Export root must be object: {display_path(path, project_root)}")
             data = {}
         exports[name] = data
         counts[name] = len(data)
@@ -103,9 +113,10 @@ def validate_exports(project_root: Path, asset_root: Path, errors: list[dict[str
                 _err(errors, "missing_export_image_prompt", f"{name} missing image_prompt", uid)
                 continue
             path = Path(image_prompt)
-            if not path.is_absolute():
-                _err(errors, "export_image_prompt_not_absolute", f"{name} image_prompt is not absolute: {image_prompt}", uid)
+            if path.is_absolute():
+                _err(errors, "export_image_prompt_absolute", f"{name} image_prompt must be relative: {image_prompt}", uid)
                 continue
+            path = resolve_asset_relpath(asset_root, image_prompt)
             if not path.exists():
                 _err(errors, "export_image_missing", f"{name} image_prompt does not exist: {path}", uid)
                 continue
@@ -136,7 +147,7 @@ def validate_condition_pack(project_root: Path, asset_root: Path, splits: list[s
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     missing_records: list[dict[str, Any]] = []
-    manifest_dir = project_root / "data" / "manifests"
+    manifest_dir = get_manifest_root()
     caption_records_all = read_jsonl(manifest_dir / "caption_index.jsonl")
     caption_records = filter_records_by_splits(caption_records_all, splits, limit)
     first_frame_records = read_jsonl(manifest_dir / "first_frames.jsonl")
@@ -268,9 +279,10 @@ def validate_condition_pack(project_root: Path, asset_root: Path, splits: list[s
         "warnings": warnings[:200],
         "truncated_issue_lists": len(errors) > 200 or len(warnings) > 200,
     }
-    write_json(project_root / "data" / "reports" / "final_validation.json", result)
-    write_jsonl(project_root / "data" / "reports" / "missing_records.jsonl", missing_records)
-    write_dataset_summary(project_root / "data" / "reports" / "dataset_summary.md", result)
+    reports_dir = get_validation_root() / "reports"
+    write_json(reports_dir / "final_validation.json", result)
+    write_jsonl(reports_dir / "missing_records.jsonl", missing_records)
+    write_dataset_summary(reports_dir / "dataset_summary.md", result)
     return result
 
 
@@ -309,14 +321,31 @@ def write_dataset_summary(path: Path, result: dict[str, Any]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Strictly validate the DL3DV condition pack.")
     parser.add_argument("--project-root", default=None)
+    parser.add_argument("--profile", default=None)
+    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--asset-root", default=None)
     parser.add_argument("--splits", nargs="*", default=None)
     parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
 
     try:
+        if args.profile:
+            activate_profile(args.profile)
         project_root = find_project_root(Path(args.project_root).resolve() if args.project_root else None)
         asset_root = Path(args.asset_root).expanduser().resolve() if args.asset_root else storage_from_local_config(project_root).asset_root
+        if args.dry_run:
+            print(
+                json.dumps(
+                    {
+                        "dry_run": True,
+                        "asset_root": str(asset_root),
+                        "manifest_root": str(get_manifest_root()),
+                        "reports_dir": str(get_validation_root() / "reports"),
+                    },
+                    indent=2,
+                )
+            )
+            return 0
         result = validate_condition_pack(project_root, asset_root, parse_splits(args.splits), args.limit)
         print(json.dumps({key: result[key] for key in ("status", "caption_records", "first_frame_records", "train_records", "test_records", "missing_first_frames", "error_count", "warning_count")}, indent=2))
         return 0 if result["status"] == "pass" else 1

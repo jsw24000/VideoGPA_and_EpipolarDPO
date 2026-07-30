@@ -11,16 +11,11 @@ import sys
 from pathlib import Path
 
 from common import iter_dirs_limited, read_json, read_yaml, resolve_config, sha256_file, write_json, write_yaml
+from vgm_common.config import write_resolved_config
+from vgm_common.paths import get_manifest_root, get_model_root, get_output_root
 
 
-REQUIRED_PATHS = [
-    "data/manifests/videogpa_protocol",
-    "data/manifests/videogpa_protocol/train_t2v.json",
-    "data/manifests/videogpa_protocol/train_i2v.json",
-    "data/manifests/videogpa_protocol/test_t2v.json",
-    "data/manifests/videogpa_protocol/test_i2v.json",
-    "data/manifests/master_all.jsonl",
-    "data/manifests/caption_index.jsonl",
+REQUIRED_REPO_PATHS = [
     "VideoGPA",
     "VideoGPA/train/Wan2.2-TI2V-5B",
     "VideoGPA/train/CogVideoX-5B",
@@ -30,8 +25,16 @@ REQUIRED_PATHS = [
     "VideoGPA/train/loss.py",
     "VideoGPA/generate",
     "VideoGPA/Wan2.2",
-    "models",
-    "outputs",
+]
+
+REQUIRED_MANIFEST_PATHS = [
+    "videogpa_protocol",
+    "videogpa_protocol/train_t2v.json",
+    "videogpa_protocol/train_i2v.json",
+    "videogpa_protocol/test_t2v.json",
+    "videogpa_protocol/test_i2v.json",
+    "master_all.jsonl",
+    "caption_index.jsonl",
 ]
 
 
@@ -85,7 +88,7 @@ def import_versions() -> dict[str, str]:
 
 
 def audit_runtime_tools(project_root: Path) -> dict[str, str]:
-    output_root = project_root / "outputs"
+    output_root = get_output_root()
     disk = shutil.disk_usage(project_root)
     ffmpeg_path = shutil.which("ffmpeg")
     ffprobe_path = shutil.which("ffprobe")
@@ -155,7 +158,7 @@ def audit_models(project_root: Path, resolved: dict) -> dict:
 
 
 def audit_model_candidates(project_root: Path) -> dict:
-    models_root = project_root / "models"
+    models_root = get_model_root()
     wan_candidates = [
         str(p.resolve())
         for p in iter_dirs_limited(models_root, max_depth=5)
@@ -226,8 +229,9 @@ def audit_manifest(project_root: Path, train_manifest: Path) -> dict:
     data = read_json(train_manifest)
     if not isinstance(data, dict):
         raise ValueError(f"Expected dict manifest for T2V train, got {type(data).__name__}")
-    master_rows = load_jsonl(project_root / "data/manifests/master_all.jsonl")
-    caption_rows = load_jsonl(project_root / "data/manifests/caption_index.jsonl")
+    manifest_root = get_manifest_root()
+    master_rows = load_jsonl(manifest_root / "master_all.jsonl")
+    caption_rows = load_jsonl(manifest_root / "caption_index.jsonl")
     master_by_uid = {row.get("scene_uid"): row for row in master_rows}
     caption_by_uid = {row.get("scene_uid"): row for row in caption_rows}
     source_counts: dict[str, int] = {}
@@ -289,9 +293,10 @@ def audit_manifest(project_root: Path, train_manifest: Path) -> dict:
 
 
 def audit_manifest_samples(project_root: Path) -> dict:
-    train_i2v = read_json(project_root / "data/manifests/videogpa_protocol/train_i2v.json")
-    master_rows = load_jsonl(project_root / "data/manifests/master_all.jsonl")
-    caption_rows = load_jsonl(project_root / "data/manifests/caption_index.jsonl")
+    manifest_root = get_manifest_root()
+    train_i2v = read_json(manifest_root / "videogpa_protocol/train_i2v.json")
+    master_rows = load_jsonl(manifest_root / "master_all.jsonl")
+    caption_rows = load_jsonl(manifest_root / "caption_index.jsonl")
     train_i2v_image_keys = 0
     train_i2v_abs_image_examples = []
     if isinstance(train_i2v, dict):
@@ -368,8 +373,8 @@ def write_report(
             "",
             "## Model Discovery",
             "",
-            f"- WAN candidates under `models/`: `{candidate_audit['wan_candidates']}`",
-            f"- VGGT candidates under `models/`: `{candidate_audit['vggt_candidates']}`",
+            f"- WAN candidates under model root: `{candidate_audit['wan_candidates']}`",
+            f"- VGGT candidates under model root: `{candidate_audit['vggt_candidates']}`",
             f"- WAN required files: `{model_audit['wan_required']}`",
             f"- WAN DiT shard count: `{model_audit['wan_dit_shard_count']}`",
             f"- WAN complete: `{model_audit['wan_complete']}`",
@@ -448,7 +453,9 @@ def main() -> None:
     project_root = Path(resolved["project"]["project_root"])
     run_dir = Path(resolved["paths"].get("run_dir") or Path(resolved["paths"]["output_root"]) / "preflight_only")
 
-    missing = [p for p in REQUIRED_PATHS if not (project_root / p).exists()]
+    manifest_root = get_manifest_root()
+    missing = [p for p in REQUIRED_REPO_PATHS if not (project_root / p).exists()]
+    missing.extend(f"{manifest_root}/{p}" for p in REQUIRED_MANIFEST_PATHS if not (manifest_root / p).exists())
     if missing:
         raise FileNotFoundError("Missing required paths: " + ", ".join(missing))
 
@@ -509,7 +516,7 @@ def main() -> None:
     preflight_dir = run_dir / "preflight"
     reports_dir = run_dir / "reports"
     config_dir.mkdir(parents=True, exist_ok=True)
-    write_yaml(config_dir / "resolved_config.yaml", resolved)
+    write_resolved_config(run_dir, resolved)
     if config_path.suffix == ".json":
         write_json(config_dir / "source_config.json", read_json(config_path))
     else:
@@ -544,7 +551,7 @@ def main() -> None:
         static,
     )
     write_report(
-        project_root / "outputs/videogpa/_preflight/latest/preflight_report.md",
+        get_output_root() / "videogpa/_preflight/latest/preflight_report.md",
         resolved,
         env,
         runtime,

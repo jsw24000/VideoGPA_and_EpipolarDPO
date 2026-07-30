@@ -40,11 +40,11 @@
 - Winner and loser still share the same timestep, noise realization, and text condition.
 - The DPO loss, frozen reference model, LoRA target modules, rank, alpha, optimizer, scheduler family, and flow-matching target remain aligned with the original WAN VideoGPA script.
 - Method impact: conditioning modality changes; preference optimization definition remains DPO.
-- Checkpoint addition: each smoke checkpoint stores PEFT adapter files, optimizer/scheduler state, trainer state, and `resolved_config.yaml` for reload/reproduction.
+- Checkpoint addition: each smoke checkpoint stores PEFT adapter files, optimizer/scheduler state, trainer state, and `config_resolved.yaml` for reload/reproduction.
 
 ## Smoke-Orchestration Difference
 
 - The official WAN script uses PyTorch Lightning and W&B orchestration.
 - The local runnable env lacks `pytorch_lightning` and `wandb`, so the T2V smoke trainer uses a direct PyTorch loop.
 - This affects smoke orchestration only, not DPO math, model calls, LoRA adapter format, or checkpoint reload validation.
-- Safety addition: `run_smoke.sh` writes stage DONE markers, `run_state.json`, fixed logs under `logs/`, and `reproduce.sh`; it does not delete user data or write generated artifacts outside `outputs/videogpa/...`.
+- Safety addition: `run_smoke.sh` writes stage DONE markers, `run_state.json`, fixed logs under `logs/`, and `reproduce.sh`; it does not delete user data or write generated artifacts outside `VGM_OUTPUT_ROOT`.

@@ -14,6 +14,21 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from vgm_common.paths import (  # noqa: E402
+    get_archives_root,
+    get_dl3dv_root,
+    get_extracted_root,
+    get_first_frames_root,
+    get_manifest_root,
+    get_repo_root,
+    get_validation_root,
+    resolve_data_path,
+)
+
 
 TRAIN_SUBSETS = ("8K", "9K", "10K", "11K")
 TEST_SUBSETS = ("1K",)
@@ -39,6 +54,8 @@ class StorageLayout:
     first_frames: Path
     download_cache: Path
     staging: Path
+    manifests: Path
+    validation: Path
 
     def as_dict(self) -> dict[str, str]:
         return {
@@ -50,15 +67,15 @@ class StorageLayout:
             "first_frames": str(self.first_frames),
             "download_cache": str(self.download_cache),
             "staging": str(self.staging),
+            "manifests": str(self.manifests),
+            "validation": str(self.validation),
         }
 
 
 def find_project_root(start: Path | None = None) -> Path:
-    current = (start or Path.cwd()).resolve()
-    for candidate in (current, *current.parents):
-        if (candidate / "VideoGPA").is_dir() and (candidate / "data").is_dir():
-            return candidate
-    raise PipelineError(f"Could not find project root from {current}")
+    if start is not None:
+        return start.expanduser().resolve()
+    return get_repo_root()
 
 
 def ensure_dirs(paths: Iterable[Path]) -> None:
@@ -75,7 +92,9 @@ def is_relative_to(path: Path, base: Path) -> bool:
 
 
 def free_bytes(path: Path) -> int:
-    target = path if path.exists() else path.parent
+    target = path
+    while not target.exists() and target != target.parent:
+        target = target.parent
     usage = shutil.disk_usage(target)
     return usage.free
 
@@ -114,73 +133,47 @@ def resolve_storage_layout(
     create: bool = True,
 ) -> StorageLayout:
     project_root = find_project_root(project_root)
-    project_data = (project_root / "data").resolve()
+    project_data = get_dl3dv_root()
     min_free = int(min_free_gb * 1024**3)
 
-    candidates: list[tuple[str, Path]] = []
     if scratch_root_arg:
-        candidates.append(("argument", normalize_scratch_arg(scratch_root_arg)))
-    elif os.environ.get("DL3DV_SCRATCH_ROOT"):
-        candidates.append(("DL3DV_SCRATCH_ROOT", normalize_scratch_arg(os.environ["DL3DV_SCRATCH_ROOT"])))
+        asset_root = Path(scratch_root_arg).expanduser().resolve()
     else:
-        for base in ("/data1", "/disk1", "/mnt/data1", "/mnt/disk1"):
-            base_path = Path(base)
-            if base_path.exists():
-                candidates.append((base, base_path.resolve() / DATA_DIRNAME))
+        asset_root = project_data
 
-    errors: list[str] = []
-    for source, asset_root in candidates:
-        try:
-            if create:
-                asset_root.mkdir(parents=True, exist_ok=True)
-            if not asset_root.exists():
-                errors.append(f"{source}: {asset_root} does not exist")
-                continue
-            if not _can_write(asset_root):
-                errors.append(f"{source}: {asset_root} is not writable")
-                continue
-            if free_bytes(asset_root) < min_free:
-                errors.append(
-                    f"{source}: {asset_root} has {human_bytes(free_bytes(asset_root))} free, "
-                    f"requires at least {human_bytes(min_free)}"
-                )
-                continue
-            if is_relative_to(asset_root, project_root):
-                raise PipelineError(f"External data root must not be inside project root: {asset_root}")
-            layout = StorageLayout(
-                project_root=project_root,
-                project_data=project_data,
-                scratch_root=asset_root,
-                asset_root=asset_root,
-                dl3dv_raw_960p=asset_root / "dl3dv_raw_960p",
-                first_frames=asset_root / "first_frames",
-                download_cache=asset_root / "download_cache",
-                staging=asset_root / "staging",
+    layout = StorageLayout(
+        project_root=project_root,
+        project_data=project_data,
+        scratch_root=asset_root,
+        asset_root=asset_root,
+        dl3dv_raw_960p=get_archives_root() if not scratch_root_arg else asset_root / "archives",
+        first_frames=get_first_frames_root() if not scratch_root_arg else asset_root / "first_frames",
+        download_cache=get_archives_root() if not scratch_root_arg else asset_root / "archives",
+        staging=get_extracted_root() if not scratch_root_arg else asset_root / "extracted",
+        manifests=get_manifest_root() if not scratch_root_arg else asset_root / "manifests",
+        validation=get_validation_root() if not scratch_root_arg else asset_root / "validation",
+    )
+
+    if create:
+        ensure_dirs(
+            [
+                layout.dl3dv_raw_960p,
+                layout.first_frames,
+                layout.download_cache,
+                layout.staging,
+                layout.manifests,
+                layout.validation / "logs",
+                layout.validation / "reports",
+            ]
+        )
+        if not _can_write(layout.validation):
+            raise PipelineError(f"Validation root is not writable: {layout.validation}")
+        if free_bytes(layout.asset_root) < min_free:
+            raise PipelineError(
+                f"{layout.asset_root} has {human_bytes(free_bytes(layout.asset_root))} free, "
+                f"requires at least {human_bytes(min_free)}"
             )
-            if is_relative_to(layout.dl3dv_raw_960p, project_data):
-                raise PipelineError(f"Raw DL3DV path resolves inside project data: {layout.dl3dv_raw_960p}")
-            if create:
-                ensure_dirs(
-                    [
-                        layout.dl3dv_raw_960p,
-                        layout.first_frames / "train" / "8K",
-                        layout.first_frames / "train" / "9K",
-                        layout.first_frames / "train" / "10K",
-                        layout.first_frames / "train" / "11K",
-                        layout.first_frames / "test" / "1K",
-                        layout.download_cache,
-                        layout.staging,
-                    ]
-                )
-            return layout
-        except PipelineError:
-            raise
-        except OSError as exc:
-            errors.append(f"{source}: {asset_root}: {exc}")
-
-    if not candidates:
-        errors.append("no DL3DV_SCRATCH_ROOT and no writable candidate among /data1, /disk1, /mnt/data1, /mnt/disk1")
-    raise PipelineError("Could not resolve writable external scratch root. " + "; ".join(errors))
+    return layout
 
 
 def write_yaml(path: Path, data: dict[str, Any]) -> None:
@@ -420,33 +413,21 @@ def resolve_asset_relpath(asset_root: Path, relpath: str) -> Path:
 
 def storage_from_local_config(project_root: Path | None = None) -> StorageLayout:
     project_root = find_project_root(project_root)
-    config_path = project_root / "data" / "configs" / "storage.local.yaml"
-    if not config_path.exists():
-        raise PipelineError(f"Missing storage config: {config_path}. Run resolve_storage.py first.")
-    data = load_yaml(config_path)
-    asset_root_value = data.get("asset_root") or data.get("scratch_root")
-    if not asset_root_value:
-        raise PipelineError(f"storage.local.yaml does not contain asset_root: {config_path}")
-    asset_root = Path(asset_root_value).expanduser().resolve()
-    return StorageLayout(
-        project_root=project_root,
-        project_data=project_root / "data",
-        scratch_root=asset_root,
-        asset_root=asset_root,
-        dl3dv_raw_960p=asset_root / "dl3dv_raw_960p",
-        first_frames=asset_root / "first_frames",
-        download_cache=asset_root / "download_cache",
-        staging=asset_root / "staging",
-    )
+    return resolve_storage_layout(project_root, None, create=False)
 
 
-def load_storage_or_resolve(project_root: Path | None = None, scratch_root: str | None = None, min_free_gb: float = 1.0) -> StorageLayout:
+def load_storage_or_resolve(
+    project_root: Path | None = None,
+    scratch_root: str | None = None,
+    min_free_gb: float = 1.0,
+    create: bool = True,
+) -> StorageLayout:
     if scratch_root:
-        return resolve_storage_layout(project_root, scratch_root, min_free_gb=min_free_gb, create=True)
+        return resolve_storage_layout(project_root, scratch_root, min_free_gb=min_free_gb, create=create)
     try:
         return storage_from_local_config(project_root)
     except PipelineError:
-        return resolve_storage_layout(project_root, None, min_free_gb=min_free_gb, create=True)
+        return resolve_storage_layout(project_root, None, min_free_gb=min_free_gb, create=create)
 
 
 def filter_records_by_splits(records: Iterable[dict[str, Any]], splits: list[str] | None, limit: int | None) -> list[dict[str, Any]]:

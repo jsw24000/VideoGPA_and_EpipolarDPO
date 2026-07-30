@@ -5,7 +5,7 @@ import argparse
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from build_condition_manifests import build_master_records
 from cleanup_raw_data import cleanup_raw_data
@@ -27,6 +27,7 @@ from dl3dv_conditions.common import (
     write_yaml,
 )
 from validate_condition_pack import validate_condition_pack
+from vgm_common.paths import activate_profile
 
 
 def stage_result(name: str, status: str, details: dict[str, Any] | None = None, error: str | None = None) -> dict[str, Any]:
@@ -42,7 +43,9 @@ def stage_result(name: str, status: str, details: dict[str, Any] | None = None, 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build the DL3DV condition data pack end to end.")
     parser.add_argument("--project-root", default=None)
+    parser.add_argument("--profile", default=None)
     parser.add_argument("--scratch-root", default=None)
+    parser.add_argument("--dry-run", action="store_true", help="Resolve paths and planned stages without writing data.")
     parser.add_argument("--splits", nargs="*", default=None)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
@@ -59,9 +62,33 @@ def main() -> int:
     parser.add_argument("--min-free-gb", type=float, default=1.0)
     args = parser.parse_args()
 
+    if args.profile:
+        activate_profile(args.profile)
     project_root = find_project_root(Path(args.project_root).resolve() if args.project_root else None)
-    run_report_path = project_root / "data" / "reports" / "build_all_conditions_run.json"
-    log_path = project_root / "data" / "logs" / "build_all_conditions.jsonl"
+    if args.dry_run:
+        layout = resolve_storage_layout(project_root, args.scratch_root, min_free_gb=args.min_free_gb, create=False)
+        print(
+            json.dumps(
+                {
+                    "dry_run": True,
+                    "project_root": str(layout.project_root),
+                    "dl3dv_root": str(layout.asset_root),
+                    "archives": str(layout.dl3dv_raw_960p),
+                    "extracted": str(layout.staging),
+                    "manifests": str(layout.manifests),
+                    "first_frames": str(layout.first_frames),
+                    "validation": str(layout.validation),
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    layout = resolve_storage_layout(project_root, args.scratch_root, min_free_gb=args.min_free_gb, create=True)
+    reports_dir = layout.validation / "reports"
+    logs_dir = layout.validation / "logs"
+    run_report_path = reports_dir / "build_all_conditions_run.json"
+    log_path = logs_dir / "build_all_conditions.jsonl"
     run: dict[str, Any] = {
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
         "project_root": str(project_root),
@@ -69,7 +96,6 @@ def main() -> int:
         "stages": [],
     }
     final_status = 0
-    layout = None
 
     def record(stage: dict[str, Any]) -> None:
         run["stages"].append(stage)
@@ -80,8 +106,7 @@ def main() -> int:
         write_json(run_report_path, run)
 
     try:
-        layout = resolve_storage_layout(project_root, args.scratch_root, min_free_gb=args.min_free_gb, create=True)
-        write_yaml(project_root / "data" / "configs" / "storage.local.yaml", build_storage_config(layout))
+        write_yaml(project_root / "configs" / "data" / "storage.local.yaml", build_storage_config(layout))
         record(
             stage_result(
                 "storage check",
@@ -106,9 +131,9 @@ def main() -> int:
 
     try:
         caption_records, caption_stats, caption_issues = inspect_captions(project_root)
-        write_json(project_root / "data" / "reports" / "caption_statistics.json", caption_stats)
-        write_jsonl(project_root / "data" / "reports" / "caption_issues.jsonl", caption_issues)
-        write_jsonl(project_root / "data" / "manifests" / "caption_index.jsonl", caption_records)
+        write_json(reports_dir / "caption_statistics.json", caption_stats)
+        write_jsonl(reports_dir / "caption_issues.jsonl", caption_issues)
+        write_jsonl(layout.manifests / "caption_index.jsonl", caption_records)
         status = "ok" if caption_stats["error_count"] == 0 else "failed"
         if status != "ok":
             final_status = 1
@@ -149,17 +174,17 @@ def main() -> int:
         records, manifest_stats = build_master_records(
             project_root,
             args.seed,
-            project_root / "data" / "manifests" / "caption_index.jsonl",
-            project_root / "data" / "manifests" / "first_frames.jsonl",
+            layout.manifests / "caption_index.jsonl",
+            layout.manifests / "first_frames.jsonl",
             splits=parse_splits(args.splits),
             limit=args.limit,
         )
         train = [record for record in records if record["split"] == "train"]
         test = [record for record in records if record["split"] == "test"]
-        write_jsonl(project_root / "data" / "manifests" / "master_train.jsonl", train)
-        write_jsonl(project_root / "data" / "manifests" / "master_test.jsonl", test)
-        write_jsonl(project_root / "data" / "manifests" / "master_all.jsonl", records)
-        write_json(project_root / "data" / "reports" / "manifest_statistics.json", manifest_stats)
+        write_jsonl(layout.manifests / "master_train.jsonl", train)
+        write_jsonl(layout.manifests / "master_test.jsonl", test)
+        write_jsonl(layout.manifests / "master_all.jsonl", records)
+        write_json(reports_dir / "manifest_statistics.json", manifest_stats)
         record(stage_result("master manifest", "ok", manifest_stats))
     except Exception as exc:
         final_status = 1
@@ -169,8 +194,8 @@ def main() -> int:
         export_stats = export_prompt_jsons(
             project_root=project_root,
             asset_root=layout.asset_root,
-            master_all_path=project_root / "data" / "manifests" / "master_all.jsonl",
-            output_dir=project_root / "data" / "manifests" / "videogpa_protocol",
+            master_all_path=layout.manifests / "master_all.jsonl",
+            output_dir=layout.manifests / "videogpa_protocol",
         )
         record(stage_result("prompt JSON export", "ok", export_stats))
     except Exception as exc:

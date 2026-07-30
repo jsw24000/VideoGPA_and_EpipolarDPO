@@ -31,6 +31,7 @@ from dl3dv_conditions.common import (
     write_json,
     write_jsonl,
 )
+from vgm_common.paths import activate_profile, get_manifest_root, get_validation_root
 
 
 def parse_splits(values: list[str] | None) -> list[str] | None:
@@ -215,8 +216,8 @@ def download_first_frames(
     min_free_gb: float = 1.0,
 ) -> dict[str, Any]:
     proxy_notes = check_proxy_environment(clear_invalid_proxy_env)
-    layout = load_storage_or_resolve(project_root, scratch_root, min_free_gb=min_free_gb)
-    caption_index_path = project_root / "data" / "manifests" / "caption_index.jsonl"
+    layout = load_storage_or_resolve(project_root, scratch_root, min_free_gb=min_free_gb, create=not dry_run)
+    caption_index_path = get_manifest_root() / "caption_index.jsonl"
     caption_records = read_jsonl(caption_index_path)
     if not caption_records:
         raise PipelineError(f"Caption index is empty or missing: {caption_index_path}")
@@ -229,8 +230,25 @@ def download_first_frames(
     for note in proxy_notes:
         print(note)
 
+    if dry_run:
+        return {
+            "hf_dataset": repo_id,
+            "hf_dataset_sha": None,
+            "asset_root": str(layout.asset_root),
+            "selected_records": len(selected),
+            "first_frame_records_total": 0,
+            "dry_run": True,
+            "resume": resume,
+            "keep_download_cache": keep_download_cache,
+            "allow_single_image_dir_fallback": allow_single_image_dir_fallback,
+            "counts": {"dry_run_would_process": len(selected)},
+            "selected_by_subset": dict(Counter(record["source_subset"] for record in selected)),
+            "failure_count": 0,
+            "seed_note": f"First-frame extraction is independent of seed {DEFAULT_SEED}; prompt seed is handled later.",
+        }
+
     info, repo_files = assert_hf_access(repo_id, token)
-    existing_path = project_root / "data" / "manifests" / "first_frames.jsonl"
+    existing_path = get_manifest_root() / "first_frames.jsonl"
     existing = {record["scene_uid"]: record for record in read_jsonl(existing_path) if "scene_uid" in record}
     output_records = dict(existing)
     failures: list[dict[str, Any]] = []
@@ -322,9 +340,8 @@ def download_first_frames(
 
     subset_order = {subset: i for i, subset in enumerate(("1K", "8K", "9K", "10K", "11K"))}
     ordered_records = sorted(output_records.values(), key=lambda item: (subset_order.get(item["source_subset"], 99), item["scene_id"]))
-    if not dry_run:
-        write_jsonl(existing_path, ordered_records)
-    write_jsonl(project_root / "data" / "reports" / "download_failures.jsonl", failures)
+    write_jsonl(existing_path, ordered_records)
+    write_jsonl(get_validation_root() / "reports" / "download_failures.jsonl", failures)
     stats = {
         "hf_dataset": repo_id,
         "hf_dataset_sha": getattr(info, "sha", None),
@@ -340,13 +357,14 @@ def download_first_frames(
         "failure_count": len(failures),
         "seed_note": f"First-frame extraction is independent of seed {DEFAULT_SEED}; prompt seed is handled later.",
     }
-    write_json(project_root / "data" / "reports" / "first_frame_statistics.json", stats)
+    write_json(get_validation_root() / "reports" / "first_frame_statistics.json", stats)
     return stats
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Download DL3DV scene archives one at a time and extract first frames.")
     parser.add_argument("--project-root", default=None)
+    parser.add_argument("--profile", default=None)
     parser.add_argument("--scratch-root", default=None)
     parser.add_argument("--splits", nargs="*", default=None, help="Subsets/splits to process, e.g. 1K or 8K 9K.")
     parser.add_argument("--limit", type=int, default=None)
@@ -362,6 +380,8 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        if args.profile:
+            activate_profile(args.profile)
         project_root = find_project_root(Path(args.project_root).resolve() if args.project_root else None)
         stats = download_first_frames(
             project_root=project_root,

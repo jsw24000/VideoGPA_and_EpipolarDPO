@@ -18,6 +18,7 @@ from dl3dv_conditions.common import (
     write_json,
     write_jsonl,
 )
+from vgm_common.paths import activate_profile, get_manifest_root, get_validation_root
 
 
 def build_master_record(caption_record: dict[str, Any], first_frame_record: dict[str, Any] | None, seed: int, project_root: Path) -> dict[str, Any]:
@@ -67,6 +68,15 @@ def parse_splits(values: list[str] | None) -> list[str] | None:
     return splits or None
 
 
+def resolve_manifest_arg(value: str, manifest_dir: Path) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    if len(path.parts) >= 2 and path.parts[0] == "data" and path.parts[1] == "manifests":
+        path = Path(*path.parts[2:])
+    return manifest_dir / path
+
+
 def build_master_records(
     project_root: Path,
     seed: int,
@@ -106,17 +116,36 @@ def build_master_records(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build portable DL3DV condition master manifests.")
     parser.add_argument("--project-root", default=None)
+    parser.add_argument("--profile", default=None)
+    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
-    parser.add_argument("--caption-index", default="data/manifests/caption_index.jsonl")
-    parser.add_argument("--first-frames-index", default="data/manifests/first_frames.jsonl")
+    parser.add_argument("--caption-index", default="caption_index.jsonl")
+    parser.add_argument("--first-frames-index", default="first_frames.jsonl")
     parser.add_argument("--splits", nargs="*", default=None)
     parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
 
     try:
+        if args.profile:
+            activate_profile(args.profile)
         project_root = find_project_root(Path(args.project_root).resolve() if args.project_root else None)
-        caption_index = (project_root / args.caption_index).resolve()
-        first_frames_index = (project_root / args.first_frames_index).resolve()
+        manifest_dir = get_manifest_root()
+        caption_index = resolve_manifest_arg(args.caption_index, manifest_dir)
+        first_frames_index = resolve_manifest_arg(args.first_frames_index, manifest_dir)
+        if args.dry_run:
+            print(
+                json.dumps(
+                    {
+                        "dry_run": True,
+                        "caption_index": str(caption_index),
+                        "first_frames_index": str(first_frames_index),
+                        "manifest_dir": str(manifest_dir),
+                        "reports_dir": str(get_validation_root() / "reports"),
+                    },
+                    indent=2,
+                )
+            )
+            return 0
         records, stats = build_master_records(
             project_root,
             args.seed,
@@ -127,11 +156,10 @@ def main() -> int:
         )
         train = [record for record in records if record["split"] == "train"]
         test = [record for record in records if record["split"] == "test"]
-        manifest_dir = project_root / "data" / "manifests"
         write_jsonl(manifest_dir / "master_train.jsonl", train)
         write_jsonl(manifest_dir / "master_test.jsonl", test)
         write_jsonl(manifest_dir / "master_all.jsonl", records)
-        write_json(project_root / "data" / "reports" / "manifest_statistics.json", stats)
+        write_json(get_validation_root() / "reports" / "manifest_statistics.json", stats)
         print(json.dumps(stats, indent=2, ensure_ascii=False))
         return 0
     except PipelineError as exc:

@@ -2,7 +2,7 @@
 
 This directory is a low-intrusion pure T2V sibling of `VideoGPA/train/Wan2.2-TI2V-5B`.
 
-It uses the same `Wan2.2-TI2V-5B` base checkpoint, but enters the model's text-only branch and trains VideoGPA DPO LoRA without a first-frame condition. Prompts come from VLM natural captions in `data/manifests/videogpa_protocol/train_t2v.json`; first frames and `image_latent` are not used.
+It uses the same `Wan2.2-TI2V-5B` base checkpoint, but enters the model's text-only branch and trains VideoGPA DPO LoRA without a first-frame condition. Prompts come from VLM natural captions resolved from `VGM_MANIFEST_ROOT/videogpa_protocol/train_t2v.json`; first frames and `image_latent` are not used.
 
 ## What Changed From TI2V
 
@@ -28,7 +28,7 @@ It uses the same `Wan2.2-TI2V-5B` base checkpoint, but enters the model's text-o
 
 The smoke config uses 4 train 8K prompts, 3 candidate seeds per prompt, and 5 optimizer steps. It is for plumbing and checkpoint validation only. It is not comparable to paper-scale training.
 
-Formal training should keep `test_t2v.json` out of the pipeline, point to the full train T2V manifest, increase generation/training scale, and write to a separate formal output root such as `outputs/videogpa/wan2.2-5b/t2v/formal`.
+Formal training should keep `test_t2v.json` out of the pipeline, point to the full train T2V manifest, increase generation/training scale, and write to a separate formal output subdir such as `videogpa/wan22_5b_t2v/formal`.
 
 The smoke chain first scores candidates with official thresholds and debug fallback disabled. If fewer than 2 preference pairs are available, the harness extends only the 8K train subset to 8 prompts, regenerates missing candidates, and only then permits fallback pairs marked `DEBUG_ONLY_NOT_COMPARABLE`.
 
@@ -36,17 +36,18 @@ The smoke chain first scores candidates with official thresholds and debug fallb
 
 For formal VideoGPA T2V training, create a separate formal YAML rather than editing the smoke config in place. Keep:
 
-- `paths.train_manifest: data/manifests/videogpa_protocol/train_t2v.json`
+- `data.manifest_relpath: manifests/videogpa_protocol/train_t2v.json`
 - `project.task: t2v`
 - no first-frame or image fields
 - `scoring.smoke_fallback_if_no_pairs: false`
-- output root under `outputs/videogpa/wan2.2-5b/t2v/formal`
+- `experiment.output_subdir: videogpa/wan22_5b_t2v/formal`
 
 To expand beyond the current 8K smoke bucket, change the subset/export stage in a formal harness to include the intended train buckets `8K`, `9K`, `10K`, and `11K`. Do not include `1K`, `test_t2v.json`, or `test_i2v.json`.
 
 This repo now includes a full formal config and harness:
 
 ```bash
+source scripts/env/activate_profile.sh local
 GPU_ID=1 VIDEOGPA_CONDA_ENV=wan22_videogpa \
 bash scripts/videogpa/wan22_5b_t2v/run_formal.sh \
   --config configs/videogpa/wan22_5b_t2v_formal.yaml
@@ -55,37 +56,39 @@ bash scripts/videogpa/wan22_5b_t2v/run_formal.sh \
 The resulting LoRA adapters are saved under:
 
 ```text
-outputs/videogpa/wan2.2-5b/t2v/formal/<run_id>/checkpoints/step_*/
+$VGM_OUTPUT_ROOT/videogpa/wan22_5b_t2v/formal/<run_id>/checkpoints/step_*/
 ```
 
 ## Portable Paths
 
-Use environment variables instead of editing source:
+Activate a profile instead of editing source:
 
-- `PROJECT_ROOT`
-- `WAN22_5B_MODEL_PATH`
-- `VGGT_MODEL_PATH`
-- `VIDEOGPA_ROOT`
-- `VIDEOGPA_OUTPUT_ROOT`
+- `VGM_REPO_ROOT`
+- `VGM_DL3DV_ROOT`
+- `VGM_MODEL_ROOT`
+- `VGM_OUTPUT_ROOT`
 - `HF_HOME`
 
 The default smoke config is `configs/videogpa/wan22_5b_t2v_smoke.yaml`.
 
-Run the smoke chain from the project root:
+Run the smoke chain after activating a profile:
 
 ```bash
+source scripts/env/activate_profile.sh local
 bash scripts/videogpa/wan22_5b_t2v/run_smoke.sh
 ```
 
 On this project the runnable environment is expected to be:
 
 ```bash
+source scripts/env/activate_profile.sh local
 VIDEOGPA_CONDA_ENV=wan22_videogpa bash scripts/videogpa/wan22_5b_t2v/run_smoke.sh
 ```
 
 Run only preflight/static checks:
 
 ```bash
+source scripts/env/activate_profile.sh local
 VIDEOGPA_CONDA_ENV=wan22_videogpa \
 bash scripts/videogpa/wan22_5b_t2v/run_smoke.sh --stop-after static_checks
 ```

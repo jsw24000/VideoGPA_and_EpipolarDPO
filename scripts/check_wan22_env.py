@@ -6,12 +6,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+from vgm_common.paths import PathConfigError, ensure_output_dir, get_model_root, get_output_root, get_repo_root
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-OUTPUT_DIR = PROJECT_ROOT / "outputs" / "wan22_smoke"
-MODEL_DIR = PROJECT_ROOT / "models" / "wan" / "Wan2.2-TI2V-5B"
-WAN_SRC_DIR = PROJECT_ROOT / "third_party" / "Wan2.2"
-VIDEOGPA_DIR = PROJECT_ROOT / "VideoGPA"
+
+def resolved_layout() -> tuple[Path, Path, Path, Path, Path]:
+    repo_root = get_repo_root()
+    output_dir = get_output_root() / "wan22_smoke"
+    model_dir = get_model_root() / "wan" / "Wan2.2-TI2V-5B"
+    wan_src_dir = repo_root / "third_party" / "Wan2.2"
+    videogpa_dir = repo_root / "VideoGPA"
+    return repo_root, output_dir, model_dir, wan_src_dir, videogpa_dir
 
 
 def package_version(distribution_name: str) -> str:
@@ -35,7 +39,7 @@ def git_commit(path: Path) -> str:
         return f"git error: {exc.output.strip()}"
 
 
-def check_model_tree() -> list[str]:
+def check_model_tree(model_dir: Path) -> list[str]:
     missing: list[str] = []
     required_files = [
         "config.json",
@@ -47,22 +51,28 @@ def check_model_tree() -> list[str]:
         "google/umt5-xxl/tokenizer.json",
     ]
     for rel in required_files:
-        if not (MODEL_DIR / rel).is_file():
+        if not (model_dir / rel).is_file():
             missing.append(rel)
 
-    shards = sorted(MODEL_DIR.glob("diffusion_pytorch_model-*.safetensors"))
+    shards = sorted(model_dir.glob("diffusion_pytorch_model-*.safetensors"))
     if not shards:
         missing.append("diffusion_pytorch_model-*.safetensors")
     return missing
 
 
 def main() -> int:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        project_root, output_dir, model_dir, wan_src_dir, videogpa_dir = resolved_layout()
+    except PathConfigError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    ensure_output_dir(output_dir)
     errors: list[str] = []
     lines: list[str] = []
 
-    if str(WAN_SRC_DIR) not in sys.path:
-        sys.path.insert(0, str(WAN_SRC_DIR))
+    if str(wan_src_dir) not in sys.path:
+        sys.path.insert(0, str(wan_src_dir))
 
     lines.append(f"Python: {sys.version.split()[0]} ({sys.executable})")
     lines.append(f"Platform: {platform.platform()}")
@@ -118,22 +128,22 @@ def main() -> int:
         importlib.import_module("wan.configs")
         lines.append("wan.configs: import ok")
     except Exception as exc:
-        errors.append(f"failed to import WAN2.2 source from {WAN_SRC_DIR}: {exc}")
+        errors.append(f"failed to import WAN2.2 source from {wan_src_dir}: {exc}")
         lines.append(f"wan.configs: IMPORT FAILED ({exc})")
 
-    missing = check_model_tree()
+    missing = check_model_tree(model_dir)
     if missing:
         errors.append("model tree is incomplete: " + ", ".join(missing))
     else:
-        shards = sorted(MODEL_DIR.glob("diffusion_pytorch_model-*.safetensors"))
+        shards = sorted(model_dir.glob("diffusion_pytorch_model-*.safetensors"))
         lines.append(f"model tree: ok ({len(shards)} diffusion safetensor shards)")
 
-    lines.append(f"WAN2.2 source path: {WAN_SRC_DIR}")
-    lines.append(f"WAN2.2 git commit: {git_commit(WAN_SRC_DIR)}")
-    lines.append(f"VideoGPA path: {VIDEOGPA_DIR}")
-    lines.append(f"VideoGPA git commit: {git_commit(VIDEOGPA_DIR)}")
-    lines.append(f"VideoGPA Wan2.2 link: {(VIDEOGPA_DIR / 'Wan2.2').resolve() if (VIDEOGPA_DIR / 'Wan2.2').exists() else 'missing'}")
-    lines.append(f"Model path: {MODEL_DIR}")
+    lines.append(f"WAN2.2 source path: {wan_src_dir}")
+    lines.append(f"WAN2.2 git commit: {git_commit(wan_src_dir)}")
+    lines.append(f"VideoGPA path: {videogpa_dir}")
+    lines.append(f"VideoGPA git commit: {git_commit(videogpa_dir)}")
+    lines.append(f"VideoGPA Wan2.2 link: {(videogpa_dir / 'Wan2.2').resolve() if (videogpa_dir / 'Wan2.2').exists() else 'missing'}")
+    lines.append(f"Model path: {model_dir}")
 
     status = "PASS" if not errors else "FAIL"
     lines.append(f"Status: {status}")
@@ -142,7 +152,7 @@ def main() -> int:
         lines.extend(f"- {err}" for err in errors)
 
     text = "\n".join(lines) + "\n"
-    (OUTPUT_DIR / "environment_versions.txt").write_text(text, encoding="utf-8")
+    (output_dir / "environment_versions.txt").write_text(text, encoding="utf-8")
     print(text, end="")
     return 0 if not errors else 1
 

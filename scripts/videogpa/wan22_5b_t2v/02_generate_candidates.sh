@@ -2,8 +2,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-CONFIG="${CONFIG:-${PROJECT_ROOT}/configs/videogpa/wan22_5b_t2v_smoke.yaml}"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/../../env/require_profile.sh"
+vgm_require_profile
+CONFIG="${CONFIG:-${VGM_REPO_ROOT}/configs/videogpa/wan22_5b_t2v_smoke.yaml}"
 RUN_DIR="${RUN_DIR:?RUN_DIR is required}"
 MODE="${MODE:-formal}"
 GPU_ID="${GPU_ID:-0}"
@@ -21,7 +23,7 @@ else
 fi
 
 if [[ "${MODE}" == "micro" ]]; then
-  "${PY_CMD[@]}" "${PROJECT_ROOT}/VideoGPA/generate/Wan2.2-T2V-5B.py" \
+  "${PY_CMD[@]}" "${VGM_REPO_ROOT}/VideoGPA/generate/Wan2.2-T2V-5B.py" \
     --config "${CONFIG}" \
     --run-dir "${RUN_DIR}" \
     --input_json "${RUN_DIR}/manifests/input_subset.json" \
@@ -32,7 +34,7 @@ if [[ "${MODE}" == "micro" ]]; then
     --candidates_per_prompt 1 \
     "${FORCE_ARGS[@]}"
 else
-  "${PY_CMD[@]}" "${PROJECT_ROOT}/VideoGPA/generate/Wan2.2-T2V-5B.py" \
+  "${PY_CMD[@]}" "${VGM_REPO_ROOT}/VideoGPA/generate/Wan2.2-T2V-5B.py" \
     --config "${CONFIG}" \
     --run-dir "${RUN_DIR}" \
     --input_json "${RUN_DIR}/manifests/input_subset.json" \

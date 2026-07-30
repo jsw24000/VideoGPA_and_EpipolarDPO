@@ -16,12 +16,22 @@ from dl3dv_conditions.common import (
     write_json,
     write_jsonl,
 )
+from vgm_common.paths import activate_profile, get_manifest_root, get_validation_root
 
 
 def resolve_asset_root(project_root: Path, asset_root_arg: str | None) -> Path:
     if asset_root_arg:
         return Path(asset_root_arg).expanduser().resolve()
     return storage_from_local_config(project_root).asset_root
+
+
+def resolve_manifest_arg(value: str, manifest_dir: Path) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    if len(path.parts) >= 2 and path.parts[0] == "data" and path.parts[1] == "manifests":
+        path = Path(*path.parts[2:])
+    return manifest_dir / path
 
 
 def require_image_path(record: dict[str, Any], asset_root: Path) -> str:
@@ -35,7 +45,7 @@ def require_image_path(record: dict[str, Any], asset_root: Path) -> str:
         image_size(path)
     except Exception as exc:
         raise PipelineError(f"First frame is not decodable for {record['scene_uid']}: {path}: {exc}") from exc
-    return str(path)
+    return relpath
 
 
 def shared_record(record: dict[str, Any], mode: str, text_prompt: str, image_prompt: str | None = None) -> dict[str, Any]:
@@ -67,7 +77,7 @@ def export_prompt_jsons(project_root: Path, asset_root: Path, master_all_path: P
     if not records:
         raise PipelineError(f"Master manifest is empty or missing: {master_all_path}")
     output_dir.mkdir(parents=True, exist_ok=True)
-    shared_dir = project_root / "data" / "manifests" / "shared_protocol"
+    shared_dir = get_manifest_root() / "shared_protocol"
     shared_dir.mkdir(parents=True, exist_ok=True)
 
     train_i2v: dict[str, dict[str, Any]] = {}
@@ -123,26 +133,47 @@ def export_prompt_jsons(project_root: Path, asset_root: Path, master_all_path: P
             "test_t2v": len(test_t2v),
         },
     }
-    write_json(project_root / "data" / "reports" / "export_statistics.json", summary)
+    write_json(get_validation_root() / "reports" / "export_statistics.json", summary)
     return summary
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Export VideoGPA-compatible prompt JSONs and shared JSONL protocol files.")
     parser.add_argument("--project-root", default=None)
+    parser.add_argument("--profile", default=None)
+    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--asset-root", default=None)
-    parser.add_argument("--master-all", default="data/manifests/master_all.jsonl")
-    parser.add_argument("--output-dir", default="data/manifests/videogpa_protocol")
+    parser.add_argument("--master-all", default="master_all.jsonl")
+    parser.add_argument("--output-dir", default="videogpa_protocol")
     args = parser.parse_args()
 
     try:
+        if args.profile:
+            activate_profile(args.profile)
         project_root = find_project_root(Path(args.project_root).resolve() if args.project_root else None)
         asset_root = resolve_asset_root(project_root, args.asset_root)
+        manifest_root = get_manifest_root()
+        master_all_path = resolve_manifest_arg(args.master_all, manifest_root)
+        output_dir = resolve_manifest_arg(args.output_dir, manifest_root)
+        if args.dry_run:
+            print(
+                json.dumps(
+                    {
+                        "dry_run": True,
+                        "asset_root": str(asset_root),
+                        "master_all": str(master_all_path),
+                        "output_dir": str(output_dir),
+                        "shared_protocol_dir": str(manifest_root / "shared_protocol"),
+                    },
+                    indent=2,
+                )
+            )
+            return 0
         summary = export_prompt_jsons(
             project_root=project_root,
             asset_root=asset_root,
-            master_all_path=(project_root / args.master_all).resolve(),
-            output_dir=(project_root / args.output_dir).resolve(),
+            master_all_path=master_all_path,
+            output_dir=output_dir,
         )
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return 0

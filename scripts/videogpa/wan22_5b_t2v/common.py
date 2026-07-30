@@ -5,22 +5,23 @@ import json
 import os
 import random
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from vgm_common.config import resolve_experiment_config  # noqa: E402
+from vgm_common.paths import get_model_root, get_repo_root, resolve_repo_path  # noqa: E402
+
 
 def find_project_root(start: Path | None = None) -> Path:
-    env_root = os.environ.get("PROJECT_ROOT")
-    if env_root:
-        return Path(env_root).expanduser().resolve()
-    cur = (start or Path(__file__)).resolve()
-    for parent in [cur, *cur.parents]:
-        if (parent / "VideoGPA").is_dir() and (parent / "data" / "manifests").is_dir():
-            return parent
-    raise RuntimeError(f"Could not locate project root from {cur}")
+    return get_repo_root()
 
 
 def read_yaml(path: Path) -> dict[str, Any]:
@@ -138,44 +139,12 @@ def _find_unique_model_dir(models_root: Path, kind: str) -> Path:
 def resolve_path(project_root: Path, value: str | os.PathLike[str]) -> Path:
     path = Path(value).expanduser()
     if not path.is_absolute():
-        path = project_root / path
-    return path.resolve()
+        return resolve_repo_path(path)
+    return path.resolve(strict=False)
 
 
 def resolve_config(config_path: Path, run_dir: Path | None = None) -> dict[str, Any]:
-    project_root = find_project_root(config_path)
-    cfg = read_yaml(config_path)
-    cfg.setdefault("project", {})
-    cfg.setdefault("paths", {})
-    cfg["project"]["project_root"] = str(project_root)
-
-    paths = cfg["paths"]
-    if os.environ.get("VIDEOGPA_ROOT"):
-        paths["videogpa_root"] = os.environ["VIDEOGPA_ROOT"]
-    if os.environ.get("VIDEOGPA_OUTPUT_ROOT"):
-        paths["output_root"] = os.environ["VIDEOGPA_OUTPUT_ROOT"]
-    if os.environ.get("WAN22_5B_MODEL_PATH"):
-        paths["wan_model_path"] = os.environ["WAN22_5B_MODEL_PATH"]
-    if os.environ.get("VGGT_MODEL_PATH"):
-        paths["vggt_model_path"] = os.environ["VGGT_MODEL_PATH"]
-
-    for key in ["videogpa_root", "train_manifest", "output_root"]:
-        paths[key] = str(resolve_path(project_root, paths[key]))
-
-    models_root = project_root / "models"
-    if paths.get("wan_model_path", "auto") == "auto":
-        paths["wan_model_path"] = str(_find_unique_model_dir(models_root, "wan"))
-    else:
-        paths["wan_model_path"] = str(resolve_path(project_root, paths["wan_model_path"]))
-
-    if paths.get("vggt_model_path", "auto") == "auto":
-        paths["vggt_model_path"] = str(_find_unique_model_dir(models_root, "vggt"))
-    else:
-        paths["vggt_model_path"] = str(resolve_path(project_root, paths["vggt_model_path"]))
-
-    if run_dir is not None:
-        cfg["paths"]["run_dir"] = str(resolve_path(project_root, run_dir))
-    return cfg
+    return resolve_experiment_config(config_path, run_dir)
 
 
 def require_files(paths: list[Path]) -> None:

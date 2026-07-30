@@ -1,5 +1,8 @@
+experiment:
+  name: wan22_5b_t2v_smoke
+  output_subdir: videogpa/wan22_5b_t2v/smoke
+
 project:
-  project_root: auto
   method: videogpa
   model_family: wan2.2
   model_scale: 5b
@@ -7,13 +10,17 @@ project:
   run_type: smoke
 
 paths:
-  videogpa_root: VideoGPA
-  wan_model_path: auto
-  vggt_model_path: auto
-  train_manifest: data/manifests/videogpa_protocol/train_t2v.json
-  output_root: outputs/videogpa/wan2.2-5b/t2v/smoke
+  videogpa_relpath: VideoGPA
+  wan_source_relpath: third_party/Wan2.2
+
+model:
+  model_relpath: wan/Wan2.2-TI2V-5B
+  vggt_model_relpath: vggt/VGGT-1B
 
 data:
+  manifest_relpath: manifests/videogpa_protocol/train_t2v.json
+  master_manifest_relpath: manifests/master_all.jsonl
+  first_frames_relroot: first_frames
   required_split: train
   required_bucket: 8k
   subset_size: 4

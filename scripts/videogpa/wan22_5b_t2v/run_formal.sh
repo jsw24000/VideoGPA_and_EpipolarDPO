@@ -2,18 +2,25 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-CONFIG="${PROJECT_ROOT}/configs/videogpa/wan22_5b_t2v_formal.yaml"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/../../env/require_profile.sh"
+vgm_require_profile
+CONFIG="${VGM_REPO_ROOT}/configs/videogpa/wan22_5b_t2v_formal.yaml"
 RUN_ID=""
 RESUME=0
 FORCE_STAGE=""
 STOP_AFTER=""
 GPU_ID="${GPU_ID:-0}"
+ORIGINAL_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config)
-      CONFIG="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
+      if [[ "$2" = /* ]]; then
+        CONFIG="$2"
+      else
+        CONFIG="${VGM_REPO_ROOT}/$2"
+      fi
       shift 2
       ;;
     --run-id)
@@ -48,19 +55,35 @@ else
 fi
 
 if [[ -z "${RUN_ID}" ]]; then
-  SHORT_HASH="$(git -C "${PROJECT_ROOT}" rev-parse --short HEAD 2>/dev/null || printf 'nogit')"
+  SHORT_HASH="$(git -C "${VGM_REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || printf 'nogit')"
   RUN_ID="$(date +%Y%m%d_%H%M%S)_${SHORT_HASH}"
 fi
 
-CONFIG_OUTPUT_ROOT="$("${PY_CMD[@]}" -c "import pathlib, sys, yaml; cfg=yaml.safe_load(open(sys.argv[1], 'r', encoding='utf-8')) or {}; root=pathlib.Path(cfg.get('project', {}).get('project_root') if cfg.get('project', {}).get('project_root') not in (None, 'auto') else sys.argv[2]).resolve(); out=pathlib.Path(cfg.get('paths', {}).get('output_root', 'outputs/videogpa/wan2.2-5b/t2v/formal')).expanduser(); print((out if out.is_absolute() else root/out).resolve())" "${CONFIG}" "${PROJECT_ROOT}")"
-OUTPUT_ROOT="${VIDEOGPA_OUTPUT_ROOT:-${CONFIG_OUTPUT_ROOT}}"
+OUTPUT_ROOT="$("${PY_CMD[@]}" -m vgm_common.config --config "${CONFIG}" --print output_root)"
 RUN_DIR="${OUTPUT_ROOT}/${RUN_ID}"
-mkdir -p "${RUN_DIR}/"{config,preflight,manifests,candidates,encoded,checkpoints,comparisons,logs,reports}
+mkdir -p "${RUN_DIR}/"{config,preflight,manifests,candidates,encoded,checkpoints,comparisons,logs,reports,samples,evaluation}
 
-export PROJECT_ROOT
 export RUN_DIR
 export CONFIG
 export GPU_ID
+
+{
+  printf 'bash'
+  printf ' %q' "$0" "${ORIGINAL_ARGS[@]}"
+  printf '\n'
+} > "${RUN_DIR}/command.txt"
+{
+  printf 'VGM_PROFILE=%s\n' "${VGM_PROFILE}"
+  printf 'VGM_REPO_ROOT=%s\n' "${VGM_REPO_ROOT}"
+  printf 'VGM_DL3DV_ROOT=%s\n' "${VGM_DL3DV_ROOT}"
+  printf 'VGM_MODEL_ROOT=%s\n' "${VGM_MODEL_ROOT}"
+  printf 'VGM_OUTPUT_ROOT=%s\n' "${VGM_OUTPUT_ROOT}"
+  printf 'PYTHONPATH=%s\n' "${PYTHONPATH:-}"
+} > "${RUN_DIR}/environment.txt"
+{
+  git -C "${VGM_REPO_ROOT}" rev-parse HEAD 2>/dev/null || true
+  git -C "${VGM_REPO_ROOT}" status --short 2>/dev/null || true
+} > "${RUN_DIR}/git_state.txt"
 
 state_update() {
   local stage="$1"
@@ -108,7 +131,9 @@ if [[ "${FORCE_STAGE}" == "generation_candidates" || "${FORCE_STAGE}" == "encodi
   FORCE_ENV=1
 fi
 
-printf '#!/usr/bin/env bash\nset -euo pipefail\nVIDEOGPA_CONDA_ENV=%q GPU_ID=%q bash %q --config %q --run-id %q --resume\n' \
+printf '#!/usr/bin/env bash\nset -euo pipefail\nsource %q %q\nVIDEOGPA_CONDA_ENV=%q GPU_ID=%q bash %q --config %q --run-id %q --resume\n' \
+  "${VGM_REPO_ROOT}/scripts/env/activate_profile.sh" \
+  "${VGM_PROFILE}" \
   "${VIDEOGPA_CONDA_ENV:-wan22_videogpa}" \
   "${GPU_ID}" \
   "${SCRIPT_DIR}/run_formal.sh" \

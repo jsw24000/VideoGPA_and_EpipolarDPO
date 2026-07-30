@@ -33,10 +33,13 @@ VIDEOGPA_ROOT = CURRENT_DIR.parents[1]
 PROJECT_ROOT = VIDEOGPA_ROOT.parent
 TRAIN_DIR = VIDEOGPA_ROOT / "train"
 WAN_PATH = VIDEOGPA_ROOT / "Wan2.2"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 for path in [TRAIN_DIR, VIDEOGPA_ROOT, WAN_PATH]:
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
+from vgm_common.config import resolve_experiment_config, write_resolved_config  # noqa: E402
 from dataset import DPODataset, collate_fn  # noqa: E402
 from loss import create_loss_strategy  # noqa: E402
 from wan.modules.model import WanModel  # noqa: E402
@@ -142,26 +145,11 @@ def find_unique_wan_model(models_root: Path) -> Path:
 
 
 def resolve_config(args: argparse.Namespace) -> dict[str, Any]:
-    cfg: dict[str, Any] = {}
-    if args.config:
-        cfg = read_yaml(Path(args.config).expanduser().resolve())
-    cfg.setdefault("project", {})
-    cfg.setdefault("paths", {})
+    if not args.config:
+        raise ValueError("--config is required so paths can be resolved through the active VGM profile")
+    cfg = resolve_experiment_config(args.config, args.run_dir, model_path_override=args.model_path)
     cfg.setdefault("training", {})
-    project_root = Path(os.environ.get("PROJECT_ROOT", PROJECT_ROOT)).expanduser().resolve()
-    run_dir = Path(args.run_dir).expanduser().resolve()
-    cfg["project"]["project_root"] = str(project_root)
     cfg["project"]["task"] = "t2v"
-    cfg["paths"]["run_dir"] = str(run_dir)
-    cfg["paths"]["videogpa_root"] = str(resolve_path(project_root, cfg["paths"].get("videogpa_root", "VideoGPA")))
-    if args.model_path:
-        cfg["paths"]["wan_model_path"] = str(resolve_path(project_root, args.model_path))
-    elif os.environ.get("WAN22_5B_MODEL_PATH"):
-        cfg["paths"]["wan_model_path"] = str(resolve_path(project_root, os.environ["WAN22_5B_MODEL_PATH"]))
-    elif cfg["paths"].get("wan_model_path", "auto") == "auto":
-        cfg["paths"]["wan_model_path"] = str(find_unique_wan_model(project_root / "models"))
-    else:
-        cfg["paths"]["wan_model_path"] = str(resolve_path(project_root, cfg["paths"]["wan_model_path"]))
     train_cfg = DEFAULT_CONFIG.copy()
     yaml_train = cfg.get("training", {})
     train_cfg.update(
@@ -418,7 +406,7 @@ def save_checkpoint(
     torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
     torch.save(scheduler.state_dict(), checkpoint_dir / "scheduler.pt")
     write_json(checkpoint_dir / "trainer_state.json", state)
-    write_yaml(checkpoint_dir / "resolved_config.yaml", resolved_config)
+    write_yaml(checkpoint_dir / "config_resolved.yaml", resolved_config)
 
 
 def train(args: argparse.Namespace) -> None:
@@ -597,7 +585,7 @@ def train(args: argparse.Namespace) -> None:
         "metrics": metrics,
     }
     write_json(run_dir / "reports/training_summary.json", summary)
-    write_yaml(run_dir / "config/resolved_config.yaml", cfg_all)
+    write_resolved_config(run_dir, cfg_all)
     print(f"Training smoke PASS. Checkpoint: {final_ckpt}")
 
 

@@ -20,6 +20,7 @@ from dl3dv_conditions.common import (
     storage_from_local_config,
     write_json,
 )
+from vgm_common.paths import activate_profile, get_manifest_root, get_validation_root
 
 
 def path_size(path: Path) -> int:
@@ -35,7 +36,7 @@ def path_size(path: Path) -> int:
 
 
 def validate_recorded_first_frames(project_root: Path, asset_root: Path) -> tuple[int, list[str]]:
-    records = read_jsonl(project_root / "data" / "manifests" / "first_frames.jsonl")
+    records = read_jsonl(get_manifest_root() / "first_frames.jsonl")
     errors: list[str] = []
     for record in records:
         uid = record.get("scene_uid", "<missing>")
@@ -87,7 +88,7 @@ def assert_safe_target(layout, target: Path) -> None:
     if any(is_relative_to(resolved, root) for root in allowed_roots):
         if is_relative_to(resolved, layout.first_frames.resolve()):
             raise PipelineError(f"Refusing to delete first_frames path: {resolved}")
-        if is_relative_to(resolved, layout.project_data.resolve()):
+        if is_relative_to(resolved, (layout.project_root / "data").resolve()):
             raise PipelineError(f"Refusing to delete project data path: {resolved}")
         return
     raise PipelineError(f"Cleanup target is outside allowed roots: {resolved}")
@@ -102,15 +103,17 @@ def cleanup_raw_data(project_root: Path, asset_root_arg: str | None, dry_run: bo
             project_data=layout.project_data,
             scratch_root=asset_root,
             asset_root=asset_root,
-            dl3dv_raw_960p=asset_root / "dl3dv_raw_960p",
+            dl3dv_raw_960p=asset_root / "archives",
             first_frames=asset_root / "first_frames",
-            download_cache=asset_root / "download_cache",
-            staging=asset_root / "staging",
+            download_cache=asset_root / "archives",
+            staging=asset_root / "extracted",
+            manifests=asset_root / "manifests",
+            validation=asset_root / "validation",
         )
     if not dry_run and not confirm_cleanup:
         raise PipelineError("Real cleanup requires --confirm-cleanup. Dry-run is the default.")
 
-    first_frame_records = read_jsonl(project_root / "data" / "manifests" / "first_frames.jsonl")
+    first_frame_records = read_jsonl(get_manifest_root() / "first_frames.jsonl")
     first_frame_count, first_frame_errors = validate_recorded_first_frames(project_root, layout.asset_root)
     if first_frame_errors:
         raise PipelineError("Refusing cleanup because recorded first frames failed validation: " + "; ".join(first_frame_errors[:20]))
@@ -141,19 +144,22 @@ def cleanup_raw_data(project_root: Path, asset_root_arg: str | None, dry_run: bo
         "free_after": human_bytes(after_free),
         "deleted": deleted,
     }
-    write_json(project_root / "data" / "reports" / "cleanup_raw_data_report.json", result)
+    write_json(get_validation_root() / "reports" / "cleanup_raw_data_report.json", result)
     return result
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Safely clean raw DL3DV staging/cache data without touching first frames.")
     parser.add_argument("--project-root", default=None)
+    parser.add_argument("--profile", default=None)
     parser.add_argument("--asset-root", default=None)
     parser.add_argument("--dry-run", action="store_true", default=True)
     parser.add_argument("--confirm-cleanup", action="store_true")
     args = parser.parse_args()
 
     try:
+        if args.profile:
+            activate_profile(args.profile)
         project_root = find_project_root(Path(args.project_root).resolve() if args.project_root else None)
         dry_run = not args.confirm_cleanup or args.dry_run
         if args.confirm_cleanup:
