@@ -48,3 +48,5 @@ __pycache__/
 *.partial
 *.tmp
 *.temp
+
+/data/first_frames.tar

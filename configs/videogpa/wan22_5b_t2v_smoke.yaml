@@ -1,0 +1,77 @@
+project:
+  project_root: auto
+  method: videogpa
+  model_family: wan2.2
+  model_scale: 5b
+  task: t2v
+  run_type: smoke
+
+paths:
+  videogpa_root: VideoGPA
+  wan_model_path: auto
+  vggt_model_path: auto
+  train_manifest: data/manifests/videogpa_protocol/train_t2v.json
+  output_root: outputs/videogpa/wan2.2-5b/t2v/smoke
+
+data:
+  required_split: train
+  required_bucket: 8k
+  subset_size: 4
+  fallback_subset_size: 8
+  subset_seed: 2026
+  candidates_per_prompt: 3
+  candidate_seeds: [1001, 1002, 1003]
+
+generation:
+  frame_num: 81
+  size: "1280*704"
+  sampling_steps: 50
+  guide_scale: 5.0
+  sample_shift: 5.0
+  sample_solver: unipc
+  fps: 24
+  offload_model: true
+  convert_model_dtype: true
+  t5_cpu: true
+
+scoring:
+  num_sampled_frames: 10
+  conf_threshold: 0
+  metric_name: consistency_score
+  metric_mode: min
+  motion_threshold: 0.001
+  min_score_gap: 0.05
+  winner_score_threshold: 0.8
+  smoke_fallback_if_no_pairs: true
+
+encoding:
+  dtype: bfloat16
+  overwrite: false
+  num_frames: 81
+
+training:
+  max_train_steps: 5
+  save_steps: 5
+  batch_size_per_gpu: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 5.0e-6
+  warmup_steps: 500
+  lora_rank: 64
+  lora_alpha: 128.0
+  lora_dropout: 0.0
+  lora_target_modules: [q, k, v, o]
+  dpo_beta: 1.0
+  seed: 2026
+  resume: auto
+  num_workers: 0
+  gradient_clip_val: 1.0
+  num_train_timesteps: 1000
+  shift: 5.0
+  enable_gradient_checkpointing: true
+  device: 0
+
+comparison:
+  prompts: 1
+  seeds: [2001]
+  generate_base: true
+  generate_lora: true
