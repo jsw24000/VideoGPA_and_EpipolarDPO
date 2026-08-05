@@ -31,6 +31,8 @@ SENTENCEPIECE_VERSION="${SENTENCEPIECE_VERSION:-0.2.0}"
 DECORD_VERSION="${DECORD_VERSION:-0.6.0}"
 LIBROSA_VERSION="${LIBROSA_VERSION:-0.10.2.post1}"
 FLASH_ATTN_VERSION="${FLASH_ATTN_VERSION:-2.8.3.post1}"
+OPENCV_HEADLESS_VERSION="${OPENCV_HEADLESS_VERSION:-4.10.0.84}"
+LPIPS_VERSION="${LPIPS_VERSION:-0.1.4}"
 
 mkdir -p "${OUTPUT_DIR}"
 
@@ -149,19 +151,24 @@ huggingface-hub==${HUGGINGFACE_HUB_VERSION}
 sentencepiece==${SENTENCEPIECE_VERSION}
 decord==${DECORD_VERSION}
 librosa==${LIBROSA_VERSION}
+opencv-python-headless==${OPENCV_HEADLESS_VERSION}
+lpips==${LPIPS_VERSION}
 EOF
 
-log "Filtering Wan2.2 requirements to avoid reinstalling torch/flash-attn"
+log "Filtering Wan2.2 requirements to avoid reinstalling torch/flash-attn/opencv-python"
 awk '
   /^[[:space:]]*($|#)/ { next }
   {
     line=$0
     key=tolower(line)
     sub(/^[[:space:]]*/, "", key)
-    if (key ~ /^(torch|torchvision|torchaudio|flash[_-]?attn)([[:space:]<>=!~].*)?$/) next
+    if (key ~ /^(torch|torchvision|torchaudio|flash[_-]?attn|opencv-python|opencv-contrib-python)([[:space:]<>=!~].*)?$/) next
     print line
   }
 ' "${WAN_SRC_DIR}/requirements.txt" > "${FILTERED_REQ}"
+
+log "Removing GUI OpenCV wheels if present"
+"${PIP[@]}" uninstall -y opencv-python opencv-contrib-python >/dev/null
 
 log "Installing pinned WAN2.2 and VideoGPA LoRA foundation packages"
 "${PIP[@]}" install -r "${PINNED_REQ}"

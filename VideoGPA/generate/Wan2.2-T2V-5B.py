@@ -7,6 +7,7 @@ import subprocess
 import sys
 import traceback
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -132,6 +133,39 @@ def parse_size(size: str) -> tuple[int, int]:
     return SIZE_CONFIGS[size]
 
 
+@lru_cache(maxsize=1)
+def available_ffmpeg_video_encoders() -> set[str]:
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-encoders"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    encoders = set()
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].startswith("V"):
+            encoders.add(parts[1])
+    return encoders
+
+
+def select_ffmpeg_video_encoder() -> tuple[str, list[str]]:
+    requested = os.environ.get("FFMPEG_VIDEO_ENCODER")
+    presets = {
+        "libx264": ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast", "-crf", "23"],
+        "libopenh264": ["-c:v", "libopenh264", "-pix_fmt", "yuv420p", "-b:v", "10M"],
+        "mpeg4": ["-c:v", "mpeg4", "-pix_fmt", "yuv420p", "-q:v", "4"],
+    }
+    if requested:
+        return requested, presets.get(requested, ["-c:v", requested, "-pix_fmt", "yuv420p"])
+    encoders = available_ffmpeg_video_encoders()
+    for name in ["libx264", "libopenh264", "mpeg4"]:
+        if name in encoders:
+            return name, presets[name]
+    return "libx264", presets["libx264"]
+
+
 def save_video_ffmpeg(video_tensor: torch.Tensor, output_path: Path, fps: int = 24, force: bool = False) -> None:
     if output_path.exists() and not force:
         raise FileExistsError(f"Refusing to overwrite existing video: {output_path}")
@@ -139,6 +173,7 @@ def save_video_ffmpeg(video_tensor: torch.Tensor, output_path: Path, fps: int = 
     video_data = video_tensor.permute(1, 2, 3, 0).cpu().numpy().clip(-1, 1)
     video_data = ((video_data + 1) * 127.5).astype(np.uint8)
     frames, height, width, _ = video_data.shape
+    encoder_name, encoder_args = select_ffmpeg_video_encoder()
     cmd = [
         "ffmpeg",
         "-y" if force else "-n",
@@ -154,17 +189,10 @@ def save_video_ffmpeg(video_tensor: torch.Tensor, output_path: Path, fps: int = 
         str(fps),
         "-i",
         "-",
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        "-preset",
-        "fast",
-        "-crf",
-        "23",
+        *encoder_args,
         str(output_path),
     ]
-    print("Running ffmpeg:", " ".join(cmd[:-1]), str(output_path))
+    print(f"Running ffmpeg with encoder={encoder_name}:", " ".join(cmd[:-1]), str(output_path))
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     stdout, stderr = proc.communicate(video_data.tobytes())
     if proc.returncode != 0:
