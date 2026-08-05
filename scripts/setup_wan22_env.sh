@@ -34,6 +34,13 @@ FLASH_ATTN_VERSION="${FLASH_ATTN_VERSION:-2.8.3.post1}"
 
 mkdir -p "${OUTPUT_DIR}"
 
+wan_source_looks_complete() {
+  [ -f "${WAN_SRC_DIR}/generate.py" ] &&
+    [ -f "${WAN_SRC_DIR}/requirements.txt" ] &&
+    [ -f "${WAN_SRC_DIR}/wan/textimage2video.py" ] &&
+    [ -f "${WAN_SRC_DIR}/wan/configs/wan_ti2v_5B.py" ]
+}
+
 command -v conda >/dev/null 2>&1 || {
   printf 'conda was not found on PATH.\n' >&2
   exit 1
@@ -84,12 +91,19 @@ log "Collecting hardware and toolchain info at ${SYSTEM_INFO_FILE}"
   uname -a
 } > "${SYSTEM_INFO_FILE}"
 
-if [ ! -d "${WAN_SRC_DIR}/.git" ]; then
+if [ -d "${WAN_SRC_DIR}/.git" ]; then
+  log "Reusing existing Wan2.2 source at ${WAN_SRC_DIR}"
+elif wan_source_looks_complete; then
+  log "Reusing existing non-git Wan2.2 source at ${WAN_SRC_DIR}"
+elif [ -e "${WAN_SRC_DIR}" ]; then
+  printf 'Wan2.2 source directory exists but does not look complete: %s\n' "${WAN_SRC_DIR}" >&2
+  printf 'Expected generate.py, requirements.txt, wan/textimage2video.py, and wan/configs/wan_ti2v_5B.py.\n' >&2
+  printf 'Move the incomplete directory aside, or set WAN_SRC_DIR to a valid Wan2.2 source checkout.\n' >&2
+  exit 1
+else
   log "Cloning official Wan2.2 source into ${WAN_SRC_DIR}"
   mkdir -p "$(dirname "${WAN_SRC_DIR}")"
   git clone "${WAN_REPO_URL}" "${WAN_SRC_DIR}"
-else
-  log "Reusing existing Wan2.2 source at ${WAN_SRC_DIR}"
 fi
 
 if [ -d "${VGM_REPO_ROOT}/VideoGPA" ]; then
