@@ -11,6 +11,7 @@ RESUME=0
 FORCE_STAGE=""
 STOP_AFTER=""
 GPU_ID="${GPU_ID:-0}"
+GPU_IDS="${GPU_IDS:-${GPU_ID}}"
 ORIGINAL_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
@@ -66,6 +67,7 @@ mkdir -p "${RUN_DIR}/"{config,preflight,manifests,candidates,encoded,checkpoints
 export RUN_DIR
 export CONFIG
 export GPU_ID
+export GPU_IDS
 
 {
   printf 'bash'
@@ -78,6 +80,8 @@ export GPU_ID
   printf 'VGM_DL3DV_ROOT=%s\n' "${VGM_DL3DV_ROOT}"
   printf 'VGM_MODEL_ROOT=%s\n' "${VGM_MODEL_ROOT}"
   printf 'VGM_OUTPUT_ROOT=%s\n' "${VGM_OUTPUT_ROOT}"
+  printf 'GPU_ID=%s\n' "${GPU_ID}"
+  printf 'GPU_IDS=%s\n' "${GPU_IDS}"
   printf 'PYTHONPATH=%s\n' "${PYTHONPATH:-}"
 } > "${RUN_DIR}/environment.txt"
 {
@@ -131,11 +135,12 @@ if [[ "${FORCE_STAGE}" == "generation_candidates" || "${FORCE_STAGE}" == "encodi
   FORCE_ENV=1
 fi
 
-printf '#!/usr/bin/env bash\nset -euo pipefail\nsource %q %q\nVIDEOGPA_CONDA_ENV=%q GPU_ID=%q bash %q --config %q --run-id %q --resume\n' \
+printf '#!/usr/bin/env bash\nset -euo pipefail\nsource %q %q\nVIDEOGPA_CONDA_ENV=%q GPU_ID=%q GPU_IDS=%q bash %q --config %q --run-id %q --resume\n' \
   "${VGM_REPO_ROOT}/scripts/env/activate_profile.sh" \
   "${VGM_PROFILE}" \
   "${VIDEOGPA_CONDA_ENV:-wan22_videogpa}" \
   "${GPU_ID}" \
+  "${GPU_IDS}" \
   "${SCRIPT_DIR}/run_formal.sh" \
   "${CONFIG}" \
   "${RUN_ID}" > "${RUN_DIR}/reproduce.sh"

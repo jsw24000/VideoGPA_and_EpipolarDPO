@@ -112,6 +112,10 @@ def main() -> None:
     parser.add_argument("--output-json", default=None)
     parser.add_argument("--pairs-json", default=None)
     parser.add_argument("--max-prompts", type=int, default=None)
+    parser.add_argument("--gpu-id", type=int, default=None)
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--allow-insufficient-pairs", action="store_true")
     parser.add_argument("--disable-debug-fallback", action="store_true")
     args = parser.parse_args()
 
@@ -133,13 +137,22 @@ def main() -> None:
     groups = data.get("groups", data if isinstance(data, list) else [])
     if args.max_prompts:
         groups = groups[: args.max_prompts]
+    if args.num_shards < 1:
+        raise ValueError("--num-shards must be positive")
+    if not 0 <= args.shard_index < args.num_shards:
+        raise ValueError("--shard-index must satisfy 0 <= shard-index < num-shards")
+    if args.num_shards > 1:
+        groups = [group for idx, group in enumerate(groups) if idx % args.num_shards == args.shard_index]
     if not groups:
         raise RuntimeError(f"No groups found in {input_json}")
 
     import lpips
     import torch
 
-    device = torch.device(f"cuda:{int(cfg['training'].get('device', 0))}" if torch.cuda.is_available() else "cpu")
+    gpu_id = args.gpu_id
+    if gpu_id is None:
+        gpu_id = int(os.environ.get("GPU_ID", cfg["training"].get("device", 0)))
+    device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         torch.cuda.set_device(device)
     os.environ.setdefault("HF_HOME", str(get_model_root() / ".hf_cache"))
@@ -183,6 +196,13 @@ def main() -> None:
     scored_payload = {
         "task": "t2v",
         "base_path": str(run_dir),
+        "metric_name": cfg["scoring"]["metric_name"],
+        "metric_mode": cfg["scoring"]["metric_mode"],
+        "motion_threshold": cfg["scoring"]["motion_threshold"],
+        "min_score_gap": cfg["scoring"]["min_score_gap"],
+        "winner_score_threshold": cfg["scoring"]["winner_score_threshold"],
+        "shard_index": args.shard_index,
+        "num_shards": args.num_shards,
         "groups": scored_groups,
     }
     write_json(output_json, scored_payload)
@@ -224,8 +244,13 @@ def main() -> None:
                 "filtered": filtered,
                 "debug_fallback_used": fallback_used,
                 "status": "INSUFFICIENT_PAIRS",
+                "shard_index": args.shard_index,
+                "num_shards": args.num_shards,
             },
         )
+        if args.allow_insufficient_pairs:
+            print(f"Shard produced fewer than 2 preference pairs: {len(pairs)}")
+            return
         raise SystemExit("Fewer than 2 preference pairs; stopping before training")
 
     pair_payload = {
@@ -238,6 +263,8 @@ def main() -> None:
         "winner_score_threshold": cfg["scoring"]["winner_score_threshold"],
         "debug_fallback_used": fallback_used,
         "debug_only": "DEBUG_ONLY_NOT_COMPARABLE" if fallback_used else False,
+        "shard_index": args.shard_index,
+        "num_shards": args.num_shards,
         "pairs": pairs,
         "filtered": filtered,
     }

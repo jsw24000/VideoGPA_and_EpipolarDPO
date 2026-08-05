@@ -68,3 +68,5 @@ __pycache__/
 *.temp
 
 /data/first_frames.tar
+/data/manifests.tar.gz
+/data/manifests.tar.gz.sha256

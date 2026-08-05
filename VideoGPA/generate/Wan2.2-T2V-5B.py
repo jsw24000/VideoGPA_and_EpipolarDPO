@@ -333,6 +333,12 @@ def generate(args: argparse.Namespace) -> None:
     samples = load_samples(input_json)
     if num_prompts:
         samples = samples[:num_prompts]
+    if args.num_shards < 1:
+        raise ValueError("--num_shards must be positive")
+    if not 0 <= args.shard_index < args.num_shards:
+        raise ValueError("--shard_index must satisfy 0 <= shard_index < num_shards")
+    if args.num_shards > 1:
+        samples = [item for idx, item in enumerate(samples) if idx % args.num_shards == args.shard_index]
     if not samples:
         raise RuntimeError("No prompts to generate")
 
@@ -443,6 +449,8 @@ def generate(args: argparse.Namespace) -> None:
             "t5_cpu": t5_cpu,
             "convert_model_dtype": convert_model_dtype,
             "seeds": seeds,
+            "shard_index": args.shard_index,
+            "num_shards": args.num_shards,
         },
         "groups": groups,
     }
@@ -467,6 +475,8 @@ def main() -> None:
     parser.add_argument("--candidates_per_prompt", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None, help="Compatibility alias for one candidate seed")
     parser.add_argument("--num_prompts", type=int, default=None)
+    parser.add_argument("--shard_index", type=int, default=0)
+    parser.add_argument("--num_shards", type=int, default=1)
     parser.add_argument("--frame_num", type=int, default=None)
     parser.add_argument("--size", type=str, default=None)
     parser.add_argument("--sampling_steps", type=int, default=None)

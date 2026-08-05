@@ -9,6 +9,7 @@ CONFIG="${CONFIG:-${VGM_REPO_ROOT}/configs/videogpa/wan22_5b_t2v_smoke.yaml}"
 RUN_DIR="${RUN_DIR:?RUN_DIR is required}"
 MODE="${MODE:-formal}"
 GPU_ID="${GPU_ID:-0}"
+GPU_IDS="${GPU_IDS:-${GPU_ID}}"
 FORCE_ARGS=()
 if [[ "${FORCE:-0}" == "1" ]]; then
   FORCE_ARGS+=(--force)
@@ -34,12 +35,53 @@ if [[ "${MODE}" == "micro" ]]; then
     --candidates_per_prompt 1 \
     "${FORCE_ARGS[@]}"
 else
-  "${PY_CMD[@]}" "${VGM_REPO_ROOT}/VideoGPA/generate/Wan2.2-T2V-5B.py" \
-    --config "${CONFIG}" \
-    --run-dir "${RUN_DIR}" \
-    --input_json "${RUN_DIR}/manifests/input_subset.json" \
-    --output_dir "${RUN_DIR}/candidates" \
-    --candidate_groups_json "${RUN_DIR}/manifests/candidate_groups.json" \
-    --gpu_id "${GPU_ID}" \
-    "${FORCE_ARGS[@]}"
+  IFS=',' read -r -a GPU_LIST <<< "${GPU_IDS}"
+  if (( ${#GPU_LIST[@]} > 1 )); then
+    shard_manifests=()
+    pids=()
+    for shard_index in "${!GPU_LIST[@]}"; do
+      gpu="${GPU_LIST[${shard_index}]}"
+      shard_manifest="${RUN_DIR}/manifests/candidate_groups.shard_${shard_index}.json"
+      shard_log="${RUN_DIR}/logs/generation.shard_${shard_index}.log"
+      shard_manifests+=("${shard_manifest}")
+      printf '[02_generate_candidates] shard %s/%s on GPU %s -> %s\n' \
+        "${shard_index}" "${#GPU_LIST[@]}" "${gpu}" "${shard_manifest}"
+      (
+        "${PY_CMD[@]}" "${VGM_REPO_ROOT}/VideoGPA/generate/Wan2.2-T2V-5B.py" \
+          --config "${CONFIG}" \
+          --run-dir "${RUN_DIR}" \
+          --input_json "${RUN_DIR}/manifests/input_subset.json" \
+          --output_dir "${RUN_DIR}/candidates" \
+          --candidate_groups_json "${shard_manifest}" \
+          --gpu_id "${gpu}" \
+          --shard_index "${shard_index}" \
+          --num_shards "${#GPU_LIST[@]}" \
+          "${FORCE_ARGS[@]}"
+      ) >"${shard_log}" 2>&1 &
+      pids+=("$!")
+    done
+    status=0
+    for pid in "${pids[@]}"; do
+      if ! wait "${pid}"; then
+        status=1
+      fi
+    done
+    if [[ "${status}" != "0" ]]; then
+      printf '[02_generate_candidates] one or more generation shards failed; see %s/logs/generation.shard_*.log\n' "${RUN_DIR}" >&2
+      exit "${status}"
+    fi
+    "${PY_CMD[@]}" "${SCRIPT_DIR}/merge_shards.py" groups \
+      --output "${RUN_DIR}/manifests/candidate_groups.json" \
+      --order-json "${RUN_DIR}/manifests/input_subset.json" \
+      "${shard_manifests[@]}"
+  else
+    "${PY_CMD[@]}" "${VGM_REPO_ROOT}/VideoGPA/generate/Wan2.2-T2V-5B.py" \
+      --config "${CONFIG}" \
+      --run-dir "${RUN_DIR}" \
+      --input_json "${RUN_DIR}/manifests/input_subset.json" \
+      --output_dir "${RUN_DIR}/candidates" \
+      --candidate_groups_json "${RUN_DIR}/manifests/candidate_groups.json" \
+      --gpu_id "${GPU_ID}" \
+      "${FORCE_ARGS[@]}"
+  fi
 fi

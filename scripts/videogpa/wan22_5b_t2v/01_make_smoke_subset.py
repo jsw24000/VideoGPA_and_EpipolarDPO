@@ -18,6 +18,13 @@ def load_jsonl(path: Path) -> list[dict]:
     return rows
 
 
+def load_optional_master(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    rows = load_jsonl(path)
+    return {row.get("scene_uid"): row for row in rows}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Create deterministic 8K train smoke subset")
     parser.add_argument("--config", required=True)
@@ -39,8 +46,8 @@ def main() -> None:
     if not isinstance(manifest, dict):
         raise ValueError("train_t2v manifest must be a dict")
 
-    master_rows = load_jsonl(get_manifest_root() / "master_all.jsonl")
-    master_by_uid = {row.get("scene_uid"): row for row in master_rows}
+    master_path = get_manifest_root() / "master_all.jsonl"
+    master_by_uid = load_optional_master(master_path)
 
     candidates = []
     for scene_uid, item in manifest.items():
@@ -50,10 +57,11 @@ def main() -> None:
         master = master_by_uid.get(scene_uid)
         if bucket.upper() != required_bucket:
             continue
-        if not master or master.get("split") != required_split:
-            continue
-        if master.get("source_subset", "").upper() != required_bucket:
-            continue
+        if master_by_uid:
+            if not master or master.get("split") != required_split:
+                continue
+            if master.get("source_subset", "").upper() != required_bucket:
+                continue
         if not prompt.strip():
             continue
         candidates.append(
@@ -80,6 +88,8 @@ def main() -> None:
         "task": "t2v",
         "source_manifest": str(train_manifest),
         "source_manifest_sha256": sha256_file(train_manifest),
+        "master_manifest": str(master_path) if master_by_uid else None,
+        "master_manifest_used": bool(master_by_uid),
         "required_split": required_split,
         "required_bucket": required_bucket.lower(),
         "subset_seed": seed,

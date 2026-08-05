@@ -21,6 +21,7 @@ fi
   "${SCRIPT_DIR}/01_make_smoke_subset.py" \
   "${SCRIPT_DIR}/01_make_train_subset.py" \
   "${SCRIPT_DIR}/score_preferences.py" \
+  "${SCRIPT_DIR}/merge_shards.py" \
   "${SCRIPT_DIR}/write_smoke_summary.py" \
   "${VGM_REPO_ROOT}/VideoGPA/generate/Wan2.2-T2V-5B.py" \
   "${VGM_REPO_ROOT}/VideoGPA/train/Wan2.2-T2V-5B/02_encode.py" \
@@ -30,6 +31,7 @@ fi
 "${PY_CMD[@]}" "${SCRIPT_DIR}/01_make_smoke_subset.py" --help >/dev/null
 "${PY_CMD[@]}" "${SCRIPT_DIR}/01_make_train_subset.py" --help >/dev/null
 "${PY_CMD[@]}" "${SCRIPT_DIR}/score_preferences.py" --help >/dev/null
+"${PY_CMD[@]}" "${SCRIPT_DIR}/merge_shards.py" --help >/dev/null
 "${PY_CMD[@]}" "${SCRIPT_DIR}/write_smoke_summary.py" --help >/dev/null
 if "${PY_CMD[@]}" -c "import torch" >/dev/null 2>&1; then
   "${PY_CMD[@]}" "${VGM_REPO_ROOT}/VideoGPA/generate/Wan2.2-T2V-5B.py" --help >/dev/null

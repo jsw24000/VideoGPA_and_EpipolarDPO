@@ -90,15 +90,20 @@ Formal output root:
 $VGM_OUTPUT_ROOT/videogpa/wan22_5b_t2v/formal/<run_id>/
 ```
 
-The formal selector reads only:
+The formal selector requires:
 
 ```text
 $VGM_MANIFEST_ROOT/videogpa_protocol/train_t2v.json
+```
+
+When present, these optional indexes are used for audit/extra validation:
+
+```text
 $VGM_MANIFEST_ROOT/master_all.jsonl
 $VGM_MANIFEST_ROOT/caption_index.jsonl
 ```
 
-It selects all train T2V scenes from buckets `8K`, `9K`, `10K`, and `11K` by default. It does not read `test_t2v.json`, `test_i2v.json`, `train_i2v.json`, or first-frame files.
+It selects all train T2V scenes from buckets `8K`, `9K`, `10K`, and `11K` by default. It does not require `test_t2v.json`, `test_i2v.json`, `train_i2v.json`, or first-frame files.
 
 Run only formal preflight/static checks:
 
@@ -121,7 +126,7 @@ Run full formal chain:
 
 ```bash
 source scripts/env/activate_profile.sh local
-GPU_ID=1 \
+GPU_IDS=0,1,2,3 \
 VIDEOGPA_CONDA_ENV=wan22_videogpa \
 bash scripts/videogpa/wan22_5b_t2v/run_formal.sh
 ```
@@ -130,12 +135,12 @@ Resume a formal run:
 
 ```bash
 source scripts/env/activate_profile.sh local
-GPU_ID=1 \
+GPU_IDS=0,1,2,3 \
 VIDEOGPA_CONDA_ENV=wan22_videogpa \
 bash scripts/videogpa/wan22_5b_t2v/run_formal.sh --resume --run-id <run_id>
 ```
 
-Formal stages are `preflight`, `static_checks`, `subset`, `generation_candidates`, `scoring`, `encoding`, and `training`. Unlike smoke, formal skips `generation_micro`, skips base/LoRA comparison generation, and disables debug fallback pairs.
+Formal stages are `preflight`, `static_checks`, `subset`, `generation_candidates`, `scoring`, `encoding`, and `training`. Unlike smoke, formal skips `generation_micro`, skips base/LoRA comparison generation, and disables debug fallback pairs. With `GPU_IDS` set to a comma-separated list, generation/scoring/encoding are sharded across those GPUs and training is launched through single-node DDP.
 
 Expected scale with the default formal config:
 
@@ -144,7 +149,7 @@ Expected scale with the default formal config:
 81 frames, 1280x704, 50 sampling steps per video
 ```
 
-This is intentionally expensive. The default formal harness is single-GPU sequential; shard generation/scoring/encoding manually for practical wall-clock time.
+This is intentionally expensive. Use `GPU_IDS=0,1,2,3` on a four-GPU node to keep all four visible GPUs active.
 
 Environment requirements:
 

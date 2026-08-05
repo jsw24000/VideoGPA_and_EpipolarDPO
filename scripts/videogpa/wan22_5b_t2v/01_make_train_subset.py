@@ -20,6 +20,13 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def load_optional_master(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    rows = load_jsonl(path)
+    return {row.get("scene_uid"): row for row in rows}
+
+
 def parse_buckets(data_cfg: dict[str, Any]) -> list[str]:
     buckets = data_cfg.get("required_buckets")
     if buckets is None:
@@ -66,8 +73,8 @@ def main() -> None:
     if not isinstance(manifest, dict):
         raise ValueError("train_t2v manifest must be a dict")
 
-    master_rows = load_jsonl(get_manifest_root() / "master_all.jsonl")
-    master_by_uid = {row.get("scene_uid"): row for row in master_rows}
+    master_path = get_manifest_root() / "master_all.jsonl"
+    master_by_uid = load_optional_master(master_path)
 
     candidates = []
     skipped = Counter()
@@ -79,12 +86,13 @@ def main() -> None:
         if bucket.upper() not in required_buckets:
             skipped["bucket"] += 1
             continue
-        if not master or master.get("split") != required_split:
-            skipped["split"] += 1
-            continue
-        if master.get("source_subset", "").upper() != bucket.upper():
-            skipped["source_subset"] += 1
-            continue
+        if master_by_uid:
+            if not master or master.get("split") != required_split:
+                skipped["split"] += 1
+                continue
+            if master.get("source_subset", "").upper() != bucket.upper():
+                skipped["source_subset"] += 1
+                continue
         if not prompt.strip():
             skipped["empty_prompt"] += 1
             continue
@@ -109,18 +117,28 @@ def main() -> None:
     if len(scene_uids) != len(set(scene_uids)):
         raise RuntimeError("Selected duplicate scene UIDs")
     counts_by_bucket = dict(Counter(item["source_bucket"] for item in selected))
+    expected_train_prompts = cfg.get("formal_requirements", {}).get("expected_train_prompts")
+    if expected_train_prompts is not None and subset_size is None and len(selected) != int(expected_train_prompts):
+        raise RuntimeError(
+            "Selected formal train sample count "
+            f"{len(selected)} != expected {int(expected_train_prompts)}. "
+            "Check train_t2v.json and master_all.jsonl consistency."
+        )
 
     out = {
         "task": "t2v",
         "run_type": cfg.get("project", {}).get("run_type", "formal"),
         "source_manifest": str(train_manifest),
         "source_manifest_sha256": sha256_file(train_manifest),
+        "master_manifest": str(master_path) if master_by_uid else None,
+        "master_manifest_used": bool(master_by_uid),
         "required_split": required_split,
         "required_buckets": [bucket.lower() for bucket in required_buckets],
         "subset_seed": seed,
         "requested_subset_size": "all" if subset_size is None else subset_size,
         "available_train": len(candidates),
         "selected_count": len(selected),
+        "expected_train_prompts": int(expected_train_prompts) if expected_train_prompts is not None else None,
         "counts_by_bucket": counts_by_bucket,
         "skipped_counts": dict(skipped),
         "selected_scene_ids": scene_ids,

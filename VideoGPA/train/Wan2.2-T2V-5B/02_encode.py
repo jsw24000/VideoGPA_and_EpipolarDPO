@@ -206,6 +206,14 @@ def encode(args: argparse.Namespace) -> None:
     if "test_t2v" in str(input_json) or "test_i2v" in str(input_json):
         raise ValueError(f"Refusing test manifest input: {input_json}")
     pairs = load_pairs(input_json)
+    if args.num_shards < 1:
+        raise ValueError("--num_shards must be positive")
+    if not 0 <= args.shard_index < args.num_shards:
+        raise ValueError("--shard_index must satisfy 0 <= shard_index < num_shards")
+    if args.num_shards > 1:
+        pairs = [pair for idx, pair in enumerate(pairs) if idx % args.num_shards == args.shard_index]
+    if not pairs:
+        raise RuntimeError(f"No preference pairs assigned to shard {args.shard_index}/{args.num_shards}")
 
     print("Resolved paths:")
     print(f"  run_dir={run_dir}")
@@ -346,6 +354,8 @@ def encode(args: argparse.Namespace) -> None:
         "task": "t2v",
         "contains_image_condition": False,
         "base_path": str(run_dir),
+        "shard_index": args.shard_index,
+        "num_shards": args.num_shards,
         "pairs": encoded_pairs,
         "groups": groups_for_dataset,
     }
@@ -364,6 +374,8 @@ def main() -> None:
     parser.add_argument("--encoded_root", default=None)
     parser.add_argument("--num_frames", type=int, default=None)
     parser.add_argument("--gpu_id", type=int, default=0)
+    parser.add_argument("--shard_index", type=int, default=0)
+    parser.add_argument("--num_shards", type=int, default=1)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     encode(args)

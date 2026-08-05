@@ -19,13 +19,16 @@ import os
 import random
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 import torch
 import yaml
 from peft import LoraConfig, PeftModel, get_peft_model
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
+from torch.utils.data.distributed import DistributedSampler
 from transformers import get_cosine_schedule_with_warmup
 
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -207,6 +210,46 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def init_distributed() -> dict[str, int | bool]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    distributed = world_size > 1
+    if distributed:
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+    return {
+        "distributed": distributed,
+        "world_size": world_size,
+        "rank": rank,
+        "local_rank": local_rank,
+        "is_main": rank == 0,
+    }
+
+
+def cleanup_distributed(state: dict[str, int | bool]) -> None:
+    if not state["distributed"]:
+        return
+    import torch.distributed as dist
+
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def distributed_barrier(state: dict[str, int | bool]) -> None:
+    if not state["distributed"]:
+        return
+    import torch.distributed as dist
+
+    dist.barrier()
+
+
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if isinstance(model, DistributedDataParallel) else model
+
+
 def get_sigma_from_timestep(timestep: torch.Tensor, num_train_timesteps: int = 1000, shift: float = 5.0) -> torch.Tensor:
     sigma = timestep.float() / num_train_timesteps
     sigma = shift * sigma / (1 + (shift - 1) * sigma)
@@ -307,7 +350,7 @@ def ensure_encoded_conditions_no_image(run_dir: Path, metadata_path: Path) -> No
             raise ValueError(f"Invalid text embedding in {pair['condition_path']}")
 
 
-def build_dataloader(run_dir: Path, metadata_path: Path, cfg: dict[str, Any]):
+def build_dataloader(run_dir: Path, metadata_path: Path, cfg: dict[str, Any], dist_state: dict[str, int | bool]):
     dataset = DPODataset(
         base_path=str(run_dir),
         metadata_path=str(metadata_path),
@@ -319,15 +362,28 @@ def build_dataloader(run_dir: Path, metadata_path: Path, cfg: dict[str, Any]):
     )
     if len(dataset) < 2:
         raise RuntimeError(f"Need at least 2 preference pairs for DPO smoke, got {len(dataset)}")
+    sampler = None
+    shuffle = True
+    if dist_state["distributed"]:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=int(dist_state["world_size"]),
+            rank=int(dist_state["rank"]),
+            shuffle=True,
+            seed=int(cfg["seed"]),
+            drop_last=False,
+        )
+        shuffle = False
     generator = torch.Generator().manual_seed(int(cfg["seed"]))
     return torch.utils.data.DataLoader(
         dataset,
         batch_size=int(cfg["batch_size"]),
-        shuffle=True,
+        shuffle=shuffle,
+        sampler=sampler,
         num_workers=0,
         collate_fn=collate_fn,
         generator=generator,
-    )
+    ), sampler
 
 
 def shared_step(
@@ -410,183 +466,255 @@ def save_checkpoint(
 
 
 def train(args: argparse.Namespace) -> None:
-    cfg_all = resolve_config(args)
-    cfg = cfg_all["training_resolved"]
-    run_dir = Path(cfg_all["paths"]["run_dir"]).resolve()
-    model_path = Path(cfg_all["paths"]["wan_model_path"]).resolve()
-    metadata_path = Path(args.metadata_path or run_dir / "manifests/encoded_pairs.json").expanduser().resolve()
-    output_dir = Path(args.output_dir or run_dir).expanduser().resolve()
-    checkpoint_root = output_dir / "checkpoints"
+    dist_state = init_distributed()
+    try:
+        cfg_all = resolve_config(args)
+        cfg = cfg_all["training_resolved"]
+        if dist_state["distributed"]:
+            cfg["device"] = int(dist_state["local_rank"])
+        run_dir = Path(cfg_all["paths"]["run_dir"]).resolve()
+        model_path = Path(cfg_all["paths"]["wan_model_path"]).resolve()
+        metadata_path = Path(args.metadata_path or run_dir / "manifests/encoded_pairs.json").expanduser().resolve()
+        output_dir = Path(args.output_dir or run_dir).expanduser().resolve()
+        checkpoint_root = output_dir / "checkpoints"
+        is_main = bool(dist_state["is_main"])
 
-    print("Resolved paths:")
-    print(f"  run_dir={run_dir}")
-    print(f"  model_path={model_path}")
-    print(f"  metadata_path={metadata_path}")
-    print(f"  checkpoint_root={checkpoint_root}")
-    print("Training mode:")
-    print("  task=t2v")
-    print("  image-conditioned branch=false")
-    print(f"  dpo_beta={cfg['beta']}")
-    print(f"  learning_rate={cfg['learning_rate']}")
-    print(f"  max_steps={cfg['max_steps']}")
-    print(f"  effective_global_batch_size={cfg['batch_size'] * cfg['accumulate_grad_batches']}")
+        def log(*items: object) -> None:
+            if is_main:
+                print(*items)
 
-    if "test_t2v" in str(metadata_path) or "test_i2v" in str(metadata_path):
-        raise ValueError(f"Refusing test metadata: {metadata_path}")
-    ensure_encoded_conditions_no_image(run_dir, metadata_path)
+        log("Resolved paths:")
+        log(f"  run_dir={run_dir}")
+        log(f"  model_path={model_path}")
+        log(f"  metadata_path={metadata_path}")
+        log(f"  checkpoint_root={checkpoint_root}")
+        log("Training mode:")
+        log("  task=t2v")
+        log("  image-conditioned branch=false")
+        log(f"  distributed={dist_state['distributed']}")
+        log(f"  world_size={dist_state['world_size']}")
+        log(f"  dpo_beta={cfg['beta']}")
+        log(f"  learning_rate={cfg['learning_rate']}")
+        log(f"  max_steps={cfg['max_steps']}")
+        effective_batch = int(cfg["batch_size"]) * int(cfg["accumulate_grad_batches"]) * int(dist_state["world_size"])
+        log(f"  effective_global_batch_size={effective_batch}")
 
-    set_seed(int(cfg["seed"]))
-    device = torch.device(f"cuda:{int(cfg['device'])}" if torch.cuda.is_available() else "cpu")
-    if device.type == "cuda":
-        torch.cuda.set_device(device)
-        torch.cuda.reset_peak_memory_stats(device)
+        if "test_t2v" in str(metadata_path) or "test_i2v" in str(metadata_path):
+            raise ValueError(f"Refusing test metadata: {metadata_path}")
+        ensure_encoded_conditions_no_image(run_dir, metadata_path)
 
-    dataloader = build_dataloader(run_dir, metadata_path, cfg)
-    print(f"DPO dataset pairs: {len(dataloader.dataset)}")
+        set_seed(int(cfg["seed"]) + int(dist_state["rank"]))
+        device = torch.device(f"cuda:{int(cfg['device'])}" if torch.cuda.is_available() else "cpu")
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+            torch.cuda.reset_peak_memory_stats(device)
 
-    print(f"Loading policy WanModel from {model_path}")
-    transformer = WanModel.from_pretrained(str(model_path))
-    transformer.to(device=device, dtype=torch.bfloat16)
-    lora_config = LoraConfig(
-        r=int(cfg["lora_rank"]),
-        lora_alpha=float(cfg["lora_alpha"]),
-        lora_dropout=float(cfg["lora_dropout"]),
-        target_modules=list(cfg["lora_target_modules"]),
-    )
-    transformer = get_peft_model(transformer, lora_config)
-    transformer.to(device)
-    if cfg.get("enable_gradient_checkpointing"):
-        enable_gradient_checkpointing(transformer)
-    stats = trainable_stats(transformer)
-    print("LoRA target modules:", cfg["lora_target_modules"])
-    print("Trainable parameter count:", stats["trainable_params"])
-    print("Trainable parameter ratio:", stats["trainable_ratio"])
-    print("Trainable parameter names:")
-    for name in stats["trainable_parameter_names"]:
-        print(f"  {name}")
-    if not stats["trainable_parameter_names"] or not all("lora_" in name for name in stats["trainable_parameter_names"]):
-        raise RuntimeError("Expected only LoRA parameters to be trainable")
+        dataloader, sampler = build_dataloader(run_dir, metadata_path, cfg, dist_state)
+        log(f"DPO dataset pairs: {len(dataloader.dataset)}")
 
-    print(f"Loading frozen reference WanModel from {model_path}")
-    ref_transformer = WanModel.from_pretrained(str(model_path))
-    ref_transformer.to(device=device, dtype=torch.bfloat16)
-    ref_transformer.requires_grad_(False)
-    ref_transformer.eval()
-    transformer.train()
-
-    loss_fn = create_loss_strategy(strategy="dpo", beta=float(cfg["beta"]))
-    optimizer = torch.optim.AdamW((p for p in transformer.parameters() if p.requires_grad), lr=float(cfg["learning_rate"]))
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=int(cfg["warmup_steps"]),
-        num_training_steps=int(cfg["max_steps"]),
-    )
-
-    lora_before = clone_trainable(transformer)
-    frozen_before = sample_frozen(transformer)
-    ref_before = sample_frozen(ref_transformer)
-    metrics = []
-    grad_nonzero = False
-    step = 0
-    data_iter = iter(dataloader)
-    while step < int(cfg["max_steps"]):
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(dataloader)
-            batch = next(data_iter)
-        step_start = time.time()
-        optimizer.zero_grad(set_to_none=True)
-        loss_out, debug = shared_step(transformer, ref_transformer, loss_fn, batch, cfg, device)
-        if not torch.isfinite(loss_out.loss).item():
-            raise RuntimeError(f"Non-finite DPO loss at step {step + 1}")
-        loss_out.loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            [p for p in transformer.parameters() if p.requires_grad],
-            max_norm=float(cfg["gradient_clip_val"]),
+        log(f"Loading policy WanModel from {model_path}")
+        transformer = WanModel.from_pretrained(str(model_path))
+        transformer.to(device=device, dtype=torch.bfloat16)
+        lora_config = LoraConfig(
+            r=int(cfg["lora_rank"]),
+            lora_alpha=float(cfg["lora_alpha"]),
+            lora_dropout=float(cfg["lora_dropout"]),
+            target_modules=list(cfg["lora_target_modules"]),
         )
-        grad_value = float(grad_norm.item() if hasattr(grad_norm, "item") else grad_norm)
-        grad_nonzero = grad_nonzero or grad_value > 0
-        optimizer.step()
-        scheduler.step()
-        step += 1
-        allocated = torch.cuda.max_memory_allocated(device) / (1024**3) if device.type == "cuda" else 0.0
-        reserved = torch.cuda.max_memory_reserved(device) / (1024**3) if device.type == "cuda" else 0.0
-        row = {
-            "step": step,
-            "total_loss": float(loss_out.loss.detach().cpu().item()),
-            "dpo_loss": float(loss_out.loss.detach().cpu().item()),
-            "winner_policy_error": debug["winner_policy_error"],
-            "loser_policy_error": debug["loser_policy_error"],
-            "winner_reference_error": debug["winner_reference_error"],
-            "loser_reference_error": debug["loser_reference_error"],
-            "implicit_reward_margin": float(loss_out.reward_margin.detach().cpu().item()),
-            "grad_norm": grad_value,
-            "learning_rate": float(scheduler.get_last_lr()[0]),
-            "gpu_allocated_gb": allocated,
-            "gpu_reserved_gb": reserved,
-            "step_time_sec": time.time() - step_start,
-            "debug_shapes": debug,
-        }
-        metrics.append(row)
-        print(json.dumps(row, ensure_ascii=False))
-        if step % int(cfg["save_steps"]) == 0 or step == int(cfg["max_steps"]):
-            save_checkpoint(
-                checkpoint_root / f"step_{step:06d}",
+        transformer = get_peft_model(transformer, lora_config)
+        transformer.to(device)
+        if cfg.get("enable_gradient_checkpointing"):
+            enable_gradient_checkpointing(transformer)
+        stats = trainable_stats(transformer)
+        log("LoRA target modules:", cfg["lora_target_modules"])
+        log("Trainable parameter count:", stats["trainable_params"])
+        log("Trainable parameter ratio:", stats["trainable_ratio"])
+        log("Trainable parameter names:")
+        for name in stats["trainable_parameter_names"]:
+            log(f"  {name}")
+        if not stats["trainable_parameter_names"] or not all("lora_" in name for name in stats["trainable_parameter_names"]):
+            raise RuntimeError("Expected only LoRA parameters to be trainable")
+
+        lora_before = clone_trainable(transformer)
+        frozen_before = sample_frozen(transformer)
+
+        if dist_state["distributed"]:
+            find_unused = os.environ.get("DDP_FIND_UNUSED_PARAMETERS", "0") == "1"
+            transformer = DistributedDataParallel(
                 transformer,
-                optimizer,
-                scheduler,
-                {
-                    "step": step,
-                    "time": dt.datetime.now().isoformat(),
-                    "config": cfg,
-                    "metrics": metrics,
-                    "trainable_stats": stats,
-                },
-                cfg_all,
+                device_ids=[int(dist_state["local_rank"])] if device.type == "cuda" else None,
+                output_device=int(dist_state["local_rank"]) if device.type == "cuda" else None,
+                find_unused_parameters=find_unused,
             )
 
-    lora_delta = trainable_delta(lora_before, transformer)
-    base_changed = frozen_param_changed(transformer, frozen_before)
-    ref_changed = frozen_param_changed(ref_transformer, ref_before)
-    final_ckpt = checkpoint_root / f"step_{step:06d}"
-    if lora_delta <= 0:
-        raise RuntimeError("LoRA parameters did not change")
-    if not grad_nonzero:
-        raise RuntimeError("No non-zero gradient observed")
-    if base_changed:
-        raise RuntimeError("A sampled frozen base parameter changed")
-    if ref_changed:
-        raise RuntimeError("A sampled reference parameter changed")
-    if not (final_ckpt / "adapter_config.json").exists():
-        raise RuntimeError(f"Missing adapter_config.json in {final_ckpt}")
+        log(f"Loading frozen reference WanModel from {model_path}")
+        ref_transformer = WanModel.from_pretrained(str(model_path))
+        ref_transformer.to(device=device, dtype=torch.bfloat16)
+        ref_transformer.requires_grad_(False)
+        ref_transformer.eval()
+        transformer.train()
 
-    del ref_transformer
-    del transformer
-    torch.cuda.empty_cache()
-    print(f"Reloading checkpoint adapter from {final_ckpt}")
-    reload_base = WanModel.from_pretrained(str(model_path))
-    reloaded = PeftModel.from_pretrained(reload_base, str(final_ckpt), adapter_name="default")
-    del reloaded, reload_base
-    torch.cuda.empty_cache()
+        loss_fn = create_loss_strategy(strategy="dpo", beta=float(cfg["beta"]))
+        optimizer = torch.optim.AdamW((p for p in transformer.parameters() if p.requires_grad), lr=float(cfg["learning_rate"]))
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=int(cfg["warmup_steps"]),
+            num_training_steps=int(cfg["max_steps"]),
+        )
 
-    summary = {
-        "status": "PASS",
-        "task": "t2v",
-        "image_conditioned_branch": False,
-        "steps": step,
-        "checkpoint_path": str(final_ckpt),
-        "checkpoint_reloaded": True,
-        "lora_delta_l1": lora_delta,
-        "grad_nonzero": grad_nonzero,
-        "base_parameters_changed": base_changed,
-        "reference_parameters_changed": ref_changed,
-        "trainable_stats": stats,
-        "metrics": metrics,
-    }
-    write_json(run_dir / "reports/training_summary.json", summary)
-    write_resolved_config(run_dir, cfg_all)
-    print(f"Training smoke PASS. Checkpoint: {final_ckpt}")
+        ref_before = sample_frozen(ref_transformer)
+        metrics = []
+        grad_nonzero = False
+        step = 0
+        data_epoch = 0
+        if sampler is not None:
+            sampler.set_epoch(data_epoch)
+        data_iter = iter(dataloader)
+        accum_steps = max(1, int(cfg["accumulate_grad_batches"]))
+
+        def next_batch() -> dict[str, Any]:
+            nonlocal data_iter, data_epoch
+            try:
+                return next(data_iter)
+            except StopIteration:
+                data_epoch += 1
+                if sampler is not None:
+                    sampler.set_epoch(data_epoch)
+                data_iter = iter(dataloader)
+                return next(data_iter)
+
+        while step < int(cfg["max_steps"]):
+            step_start = time.time()
+            optimizer.zero_grad(set_to_none=True)
+            debug: dict[str, Any] = {}
+            step_loss = 0.0
+            reward_margin = 0.0
+            for micro_idx in range(accum_steps):
+                batch = next_batch()
+                sync_context = (
+                    transformer.no_sync()
+                    if dist_state["distributed"] and micro_idx < accum_steps - 1
+                    else nullcontext()
+                )
+                with sync_context:
+                    loss_out, debug = shared_step(transformer, ref_transformer, loss_fn, batch, cfg, device)
+                    if not torch.isfinite(loss_out.loss).item():
+                        raise RuntimeError(f"Non-finite DPO loss at step {step + 1}, microbatch {micro_idx + 1}")
+                    (loss_out.loss / accum_steps).backward()
+                step_loss += float(loss_out.loss.detach().cpu().item()) / accum_steps
+                reward_margin += float(loss_out.reward_margin.detach().cpu().item()) / accum_steps
+
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                [p for p in transformer.parameters() if p.requires_grad],
+                max_norm=float(cfg["gradient_clip_val"]),
+            )
+            grad_value = float(grad_norm.item() if hasattr(grad_norm, "item") else grad_norm)
+            grad_nonzero = grad_nonzero or grad_value > 0
+            optimizer.step()
+            scheduler.step()
+            step += 1
+            allocated = torch.cuda.max_memory_allocated(device) / (1024**3) if device.type == "cuda" else 0.0
+            reserved = torch.cuda.max_memory_reserved(device) / (1024**3) if device.type == "cuda" else 0.0
+            row = {
+                "step": step,
+                "rank": int(dist_state["rank"]),
+                "world_size": int(dist_state["world_size"]),
+                "total_loss": step_loss,
+                "dpo_loss": step_loss,
+                "winner_policy_error": debug["winner_policy_error"],
+                "loser_policy_error": debug["loser_policy_error"],
+                "winner_reference_error": debug["winner_reference_error"],
+                "loser_reference_error": debug["loser_reference_error"],
+                "implicit_reward_margin": reward_margin,
+                "grad_norm": grad_value,
+                "learning_rate": float(scheduler.get_last_lr()[0]),
+                "gpu_allocated_gb": allocated,
+                "gpu_reserved_gb": reserved,
+                "step_time_sec": time.time() - step_start,
+                "debug_shapes": debug,
+            }
+            if is_main:
+                metrics.append(row)
+                print(json.dumps(row, ensure_ascii=False))
+            if is_main and (step % int(cfg["save_steps"]) == 0 or step == int(cfg["max_steps"])):
+                save_checkpoint(
+                    checkpoint_root / f"step_{step:06d}",
+                    unwrap_model(transformer),
+                    optimizer,
+                    scheduler,
+                    {
+                        "step": step,
+                        "time": dt.datetime.now().isoformat(),
+                        "config": cfg,
+                        "metrics": metrics,
+                        "trainable_stats": stats,
+                        "distributed": dist_state,
+                        "effective_global_batch_size": effective_batch,
+                    },
+                    cfg_all,
+                )
+            distributed_barrier(dist_state)
+
+        if dist_state["distributed"]:
+            import torch.distributed as dist
+
+            flag = torch.tensor([1 if grad_nonzero else 0], device=device)
+            dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+            grad_nonzero = bool(flag.item())
+
+        final_ckpt = checkpoint_root / f"step_{step:06d}"
+        if is_main:
+            policy_model = unwrap_model(transformer)
+            lora_delta = trainable_delta(lora_before, policy_model)
+            base_changed = frozen_param_changed(policy_model, frozen_before)
+            ref_changed = frozen_param_changed(ref_transformer, ref_before)
+            if lora_delta <= 0:
+                raise RuntimeError("LoRA parameters did not change")
+            if not grad_nonzero:
+                raise RuntimeError("No non-zero gradient observed")
+            if base_changed:
+                raise RuntimeError("A sampled frozen base parameter changed")
+            if ref_changed:
+                raise RuntimeError("A sampled reference parameter changed")
+            if not (final_ckpt / "adapter_config.json").exists():
+                raise RuntimeError(f"Missing adapter_config.json in {final_ckpt}")
+
+        distributed_barrier(dist_state)
+        del ref_transformer
+        del transformer
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        if is_main:
+            print(f"Reloading checkpoint adapter from {final_ckpt}")
+            reload_base = WanModel.from_pretrained(str(model_path))
+            reloaded = PeftModel.from_pretrained(reload_base, str(final_ckpt), adapter_name="default")
+            del reloaded, reload_base
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+            summary = {
+                "status": "PASS",
+                "task": "t2v",
+                "image_conditioned_branch": False,
+                "distributed": dist_state,
+                "effective_global_batch_size": effective_batch,
+                "steps": step,
+                "checkpoint_path": str(final_ckpt),
+                "checkpoint_reloaded": True,
+                "lora_delta_l1": lora_delta,
+                "grad_nonzero": grad_nonzero,
+                "base_parameters_changed": base_changed,
+                "reference_parameters_changed": ref_changed,
+                "trainable_stats": stats,
+                "metrics": metrics,
+            }
+            write_json(run_dir / "reports/training_summary.json", summary)
+            write_resolved_config(run_dir, cfg_all)
+            print(f"Training PASS. Checkpoint: {final_ckpt}")
+        distributed_barrier(dist_state)
+    finally:
+        cleanup_distributed(dist_state)
 
 
 def main() -> None:

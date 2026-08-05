@@ -80,4 +80,4 @@ formal_requirements:
   expected_train_prompts: 3147
   expected_candidate_videos: 9441
   huggingface_hub: ">=0.30.0,<1.0 when using transformers==4.51.3"
-  note: "Full formal reproduction is single-GPU sequential by default and can take many GPU-days unless generation/scoring/encoding are sharded manually."
+  note: "Set GPU_IDS=0,1,2,3 to shard generation/scoring/encoding and launch DDP LoRA training across four visible GPUs."

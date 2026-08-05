@@ -30,6 +30,9 @@ REQUIRED_REPO_PATHS = [
 REQUIRED_MANIFEST_PATHS = [
     "videogpa_protocol",
     "videogpa_protocol/train_t2v.json",
+]
+
+OPTIONAL_MANIFEST_PATHS = [
     "videogpa_protocol/train_i2v.json",
     "videogpa_protocol/test_t2v.json",
     "videogpa_protocol/test_i2v.json",
@@ -225,13 +228,19 @@ def load_jsonl(path: Path) -> list[dict]:
     return rows
 
 
+def load_optional_jsonl(path: Path) -> list[dict]:
+    return load_jsonl(path) if path.exists() else []
+
+
 def audit_manifest(project_root: Path, train_manifest: Path) -> dict:
     data = read_json(train_manifest)
     if not isinstance(data, dict):
         raise ValueError(f"Expected dict manifest for T2V train, got {type(data).__name__}")
     manifest_root = get_manifest_root()
-    master_rows = load_jsonl(manifest_root / "master_all.jsonl")
-    caption_rows = load_jsonl(manifest_root / "caption_index.jsonl")
+    master_path = manifest_root / "master_all.jsonl"
+    caption_path = manifest_root / "caption_index.jsonl"
+    master_rows = load_optional_jsonl(master_path)
+    caption_rows = load_optional_jsonl(caption_path)
     master_by_uid = {row.get("scene_uid"): row for row in master_rows}
     caption_by_uid = {row.get("scene_uid"): row for row in caption_rows}
     source_counts: dict[str, int] = {}
@@ -268,6 +277,8 @@ def audit_manifest(project_root: Path, train_manifest: Path) -> dict:
         "sha256": sha256_file(train_manifest),
         "top_type": type(data).__name__,
         "total_samples": len(data),
+        "master_manifest_present": master_path.exists(),
+        "caption_index_present": caption_path.exists(),
         "scene_id_field": "dict key scene_uid, formatted source_subset/scene_id",
         "prompt_field": "text_prompt",
         "source_counts": source_counts,
@@ -294,9 +305,10 @@ def audit_manifest(project_root: Path, train_manifest: Path) -> dict:
 
 def audit_manifest_samples(project_root: Path) -> dict:
     manifest_root = get_manifest_root()
-    train_i2v = read_json(manifest_root / "videogpa_protocol/train_i2v.json")
-    master_rows = load_jsonl(manifest_root / "master_all.jsonl")
-    caption_rows = load_jsonl(manifest_root / "caption_index.jsonl")
+    train_i2v_path = manifest_root / "videogpa_protocol/train_i2v.json"
+    train_i2v = read_json(train_i2v_path) if train_i2v_path.exists() else None
+    master_rows = load_optional_jsonl(manifest_root / "master_all.jsonl")
+    caption_rows = load_optional_jsonl(manifest_root / "caption_index.jsonl")
     train_i2v_image_keys = 0
     train_i2v_abs_image_examples = []
     if isinstance(train_i2v, dict):
@@ -313,6 +325,7 @@ def audit_manifest_samples(project_root: Path) -> dict:
     return {
         "train_i2v_top_type": type(train_i2v).__name__,
         "train_i2v_total_samples": len(train_i2v) if isinstance(train_i2v, dict) else None,
+        "train_i2v_present": train_i2v_path.exists(),
         "train_i2v_image_key_count_preview": train_i2v_image_keys,
         "train_i2v_absolute_image_examples": train_i2v_abs_image_examples,
         "master_rows": len(master_rows),
@@ -396,9 +409,11 @@ def write_report(
             f"- top_type: `{manifest['top_type']}`",
             f"- total_samples: `{manifest['total_samples']}`",
             f"- sha256: `{manifest['sha256']}`",
+            f"- master_manifest_present: `{manifest['master_manifest_present']}`",
+            f"- caption_index_present: `{manifest['caption_index_present']}`",
             f"- scene_id_field: `{manifest['scene_id_field']}`",
             f"- prompt_field: `{manifest['prompt_field']}`",
-            "- split_field: `resolved through master_all.jsonl split`",
+            "- split_field: `master_all.jsonl when present; otherwise inferred from train_t2v manifest`",
             f"- source_counts: `{manifest['source_counts']}`",
             f"- empty_prompt_count: `{manifest['empty_prompt_count']}`",
             f"- duplicate_scene_id_count: `{manifest['duplicate_scene_id_count']}`",
@@ -407,6 +422,7 @@ def write_report(
             f"- trace_caption_count: `{manifest['trace_caption_count']}`",
             f"- prompt_exact_master_count: `{manifest['prompt_exact_master_count']}`",
             f"- prompt_exact_caption_count: `{manifest['prompt_exact_caption_count']}`",
+            f"- train_i2v_present: `{manifest_samples['train_i2v_present']}`",
             f"- train_i2v_top_type: `{manifest_samples['train_i2v_top_type']}`",
             f"- train_i2v_total_samples: `{manifest_samples['train_i2v_total_samples']}`",
             f"- train_i2v_absolute_image_examples: `{manifest_samples['train_i2v_absolute_image_examples']}`",
@@ -501,6 +517,17 @@ def main() -> None:
     if manifest["image_related_key_examples"]:
         ready = False
         caveats.append("unexpected image keys in train_t2v")
+    expected_train_prompts = resolved.get("formal_requirements", {}).get("expected_train_prompts")
+    if expected_train_prompts is not None and manifest["total_samples"] != int(expected_train_prompts):
+        ready = False
+        caveats.append(
+            f"train_t2v sample count {manifest['total_samples']} != expected {int(expected_train_prompts)}"
+        )
+    if manifest["master_manifest_present"] and manifest["trace_master_count"] != manifest["total_samples"]:
+        ready = False
+        caveats.append(
+            f"master_all trace count {manifest['trace_master_count']} != train_t2v count {manifest['total_samples']}"
+        )
 
     static = {
         "status": "PASS" if ready else "FAIL",
