@@ -15,7 +15,7 @@ python scripts/env/check_paths.py
 Cluster setup:
 
 ```bash
-cd /data/pbq/system/peibaoqi/lhxk/zk/repos/VideoGPA_and_EpipolarDPO
+cd /data/pbq/system/peibaoqi/project_a/zk/repos/VideoGPA_and_EpipolarDPO
 source scripts/env/activate_profile.sh cluster_zk
 python scripts/env/check_paths.py --strict
 ```

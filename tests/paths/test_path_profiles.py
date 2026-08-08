@@ -28,7 +28,7 @@ def test_cluster_profile_non_strict_resolves_without_existing_remote_dirs() -> N
     proc = run_bash("source scripts/env/activate_profile.sh cluster_zk >/dev/null && python scripts/env/check_paths.py")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "VGM_PROFILE=cluster_zk" in proc.stdout
-    assert "VGM_REPO_ROOT=/data/pbq/system/peibaoqi/lhxk/zk/repos/VideoGPA_and_EpipolarDPO" in proc.stdout
+    assert "VGM_REPO_ROOT=/data/pbq/system/peibaoqi/project_a/zk/repos/VideoGPA_and_EpipolarDPO" in proc.stdout
 
 
 def test_smoke_yaml_resolves_to_local_roots() -> None:

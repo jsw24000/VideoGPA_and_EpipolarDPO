@@ -3,7 +3,7 @@
 Use cluster-owned data, model, and output folders outside the clone:
 
 ```bash
-cd /data/pbq/system/peibaoqi/lhxk/zk/repos/VideoGPA_and_EpipolarDPO
+cd /data/pbq/system/peibaoqi/project_a/zk/repos/VideoGPA_and_EpipolarDPO
 source scripts/env/activate_profile.sh cluster_zk
 python scripts/env/check_paths.py --strict
 ```
@@ -11,11 +11,11 @@ python scripts/env/check_paths.py --strict
 Expected roots:
 
 ```text
-VGM_ROOT=/data/pbq/system/peibaoqi/lhxk/zk
-VGM_REPO_ROOT=/data/pbq/system/peibaoqi/lhxk/zk/repos/VideoGPA_and_EpipolarDPO
-VGM_DL3DV_ROOT=/data/pbq/system/peibaoqi/lhxk/zk/data/DL3DV-ALL-960P
-VGM_MODEL_ROOT=/data/pbq/system/peibaoqi/lhxk/zk/models
-VGM_OUTPUT_ROOT=/data/pbq/system/peibaoqi/lhxk/zk/outputs/VideoGPA_and_EpipolarDPO
+VGM_ROOT=/data/pbq/system/peibaoqi/project_a/zk
+VGM_REPO_ROOT=/data/pbq/system/peibaoqi/project_a/zk/repos/VideoGPA_and_EpipolarDPO
+VGM_DL3DV_ROOT=/data/pbq/system/peibaoqi/project_a/zk/data/DL3DV-ALL-960P
+VGM_MODEL_ROOT=/data/pbq/system/peibaoqi/project_a/zk/models
+VGM_OUTPUT_ROOT=/data/pbq/system/peibaoqi/project_a/zk/outputs/VideoGPA_and_EpipolarDPO
 ```
 
 DL3DV subdirectories:
