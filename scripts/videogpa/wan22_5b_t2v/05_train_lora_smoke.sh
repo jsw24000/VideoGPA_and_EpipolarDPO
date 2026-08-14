@@ -9,6 +9,28 @@ CONFIG="${CONFIG:-${VGM_REPO_ROOT}/configs/videogpa/wan22_5b_t2v_smoke.yaml}"
 RUN_DIR="${RUN_DIR:?RUN_DIR is required}"
 GPU_ID="${GPU_ID:-0}"
 GPU_IDS="${GPU_IDS:-${GPU_ID}}"
+TRAIN_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --resume)
+      TRAIN_ARGS+=(--resume)
+      shift
+      ;;
+    --resume-from-checkpoint|--resume_from_checkpoint)
+      TRAIN_ARGS+=(--resume_from_checkpoint "$2")
+      shift 2
+      ;;
+    --validate-resume-only|--validate_resume_only)
+      TRAIN_ARGS+=(--validate_resume_only)
+      shift
+      ;;
+    *)
+      printf 'Unknown argument: %s\n' "$1" >&2
+      exit 2
+      ;;
+  esac
+done
 
 PY_CMD=()
 if [[ -n "${PYTHON_BIN:-}" ]]; then
@@ -29,12 +51,14 @@ if (( ${#GPU_LIST[@]} > 1 )); then
     --run-dir "${RUN_DIR}" \
     --metadata_path "${RUN_DIR}/manifests/encoded_pairs.json" \
     --output_dir "${RUN_DIR}" \
-    --device 0
+    --device 0 \
+    "${TRAIN_ARGS[@]}"
 else
   "${PY_CMD[@]}" "${VGM_REPO_ROOT}/VideoGPA/train/Wan2.2-T2V-5B/03_train.py" \
     --config "${CONFIG}" \
     --run-dir "${RUN_DIR}" \
     --metadata_path "${RUN_DIR}/manifests/encoded_pairs.json" \
     --output_dir "${RUN_DIR}" \
-    --device "${GPU_ID}"
+    --device "${GPU_ID}" \
+    "${TRAIN_ARGS[@]}"
 fi

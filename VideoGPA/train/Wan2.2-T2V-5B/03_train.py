@@ -26,6 +26,10 @@ from typing import Any
 import torch
 import yaml
 from peft import LoraConfig, PeftModel, get_peft_model
+try:
+    from peft import set_peft_model_state_dict
+except ImportError:  # pragma: no cover - depends on remote PEFT version
+    set_peft_model_state_dict = None
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from torch.utils.data.distributed import DistributedSampler
@@ -45,6 +49,18 @@ for path in [TRAIN_DIR, VIDEOGPA_ROOT, WAN_PATH]:
 from vgm_common.config import resolve_experiment_config, write_resolved_config  # noqa: E402
 from dataset import DPODataset, collate_fn  # noqa: E402
 from loss import create_loss_strategy  # noqa: E402
+from resume_utils import (  # noqa: E402
+    ResumeError,
+    compute_resume_data_cursor,
+    discover_latest_checkpoint,
+    ensure_checkpoint_save_target_safe,
+    parse_checkpoint_step,
+    read_json as read_resume_json,
+    read_yaml as read_resume_yaml,
+    validate_checkpoint_manifest,
+    validate_resume_config,
+    validate_resume_metadata,
+)
 from wan.modules.model import WanModel  # noqa: E402
 
 
@@ -200,6 +216,13 @@ def resolve_config(args: argparse.Namespace) -> dict[str, Any]:
 def torch_load(path: Path) -> Any:
     try:
         return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def torch_load_full(path: Path) -> Any:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:
         return torch.load(path, map_location="cpu")
 
@@ -386,6 +409,192 @@ def build_dataloader(run_dir: Path, metadata_path: Path, cfg: dict[str, Any], di
     ), sampler
 
 
+def resolve_resume_checkpoint(args: argparse.Namespace, checkpoint_root: Path) -> Path | None:
+    if args.resume_from_checkpoint:
+        return Path(args.resume_from_checkpoint).expanduser().resolve()
+    if args.resume:
+        return discover_latest_checkpoint(checkpoint_root)
+    if args.validate_resume_only:
+        raise ValueError("--validate_resume_only requires --resume or --resume_from_checkpoint")
+    return None
+
+
+def _load_adapter_tensor_file(path: Path) -> dict[str, torch.Tensor]:
+    if path.suffix == ".safetensors":
+        try:
+            from safetensors.torch import load_file
+        except ImportError as exc:  # pragma: no cover - remote dependency
+            raise RuntimeError("safetensors is required to load adapter_model.safetensors") from exc
+        state = load_file(str(path), device="cpu")
+    else:
+        state = torch_load(path)
+    if not isinstance(state, dict) or not state:
+        raise RuntimeError(f"Adapter state is empty or invalid: {path}")
+    non_tensors = [key for key, value in state.items() if not isinstance(value, torch.Tensor)]
+    if non_tensors:
+        raise RuntimeError(f"Adapter state contains non-tensor entries: {non_tensors[:8]}")
+    return state
+
+
+def _adapter_key_candidates(key: str) -> list[str]:
+    candidates = [key]
+    replacements = {
+        ".lora_A.": ".lora_A.default.",
+        ".lora_B.": ".lora_B.default.",
+        ".lora_embedding_A.": ".lora_embedding_A.default.",
+        ".lora_embedding_B.": ".lora_embedding_B.default.",
+    }
+    for old, new in replacements.items():
+        if old in key:
+            candidates.append(key.replace(old, new))
+    if not key.startswith("base_model.model."):
+        candidates.extend([f"base_model.model.{candidate}" for candidate in list(candidates)])
+    return candidates
+
+
+def _map_adapter_keys_to_model(
+    adapter_state: dict[str, torch.Tensor],
+    model: torch.nn.Module,
+) -> dict[str, str]:
+    model_state = model.state_dict()
+    model_lora_keys = sorted(key for key in model_state if "lora_" in key)
+    mapped: dict[str, str] = {}
+    missing = []
+    shape_mismatches = []
+    for checkpoint_key, checkpoint_value in adapter_state.items():
+        model_key = next((candidate for candidate in _adapter_key_candidates(checkpoint_key) if candidate in model_state), None)
+        if model_key is None:
+            missing.append(checkpoint_key)
+            continue
+        if tuple(model_state[model_key].shape) != tuple(checkpoint_value.shape):
+            shape_mismatches.append(
+                f"{checkpoint_key}: checkpoint={tuple(checkpoint_value.shape)} model={tuple(model_state[model_key].shape)}"
+            )
+            continue
+        mapped[checkpoint_key] = model_key
+    missing_model_lora = sorted(set(model_lora_keys) - set(mapped.values()))
+    if missing or shape_mismatches or missing_model_lora:
+        details = []
+        if missing:
+            details.append(f"unmatched checkpoint LoRA keys: {missing[:8]}")
+        if shape_mismatches:
+            details.append(f"shape mismatches: {shape_mismatches[:8]}")
+        if missing_model_lora:
+            details.append(f"model LoRA keys absent from checkpoint: {missing_model_lora[:8]}")
+        raise RuntimeError("; ".join(details))
+    return mapped
+
+
+def load_lora_adapter_strict(model: torch.nn.Module, adapter_path: Path) -> dict[str, Any]:
+    if set_peft_model_state_dict is None:
+        raise RuntimeError("This PEFT version does not expose set_peft_model_state_dict; refusing unsafe resume")
+    adapter_state = _load_adapter_tensor_file(adapter_path)
+    mapped_keys = _map_adapter_keys_to_model(adapter_state, model)
+    result = set_peft_model_state_dict(model, adapter_state, adapter_name="default")
+    missing_lora = [key for key in getattr(result, "missing_keys", []) if "lora_" in key]
+    unexpected_lora = [key for key in getattr(result, "unexpected_keys", []) if "lora_" in key]
+    if missing_lora or unexpected_lora:
+        raise RuntimeError(f"PEFT adapter load mismatch: missing={missing_lora[:8]} unexpected={unexpected_lora[:8]}")
+
+    model_state = model.state_dict()
+    max_abs_diff = 0.0
+    worst_key = None
+    for checkpoint_key, model_key in mapped_keys.items():
+        expected = adapter_state[checkpoint_key].to(dtype=model_state[model_key].dtype)
+        actual = model_state[model_key].detach().cpu()
+        diff = (actual.float() - expected.float()).abs().max().item()
+        if diff > max_abs_diff:
+            max_abs_diff = diff
+            worst_key = checkpoint_key
+    if max_abs_diff != 0.0:
+        raise RuntimeError(f"Adapter verification failed: max_abs_diff={max_abs_diff} at {worst_key}")
+    return {
+        "adapter_path": str(adapter_path),
+        "tensor_count": len(adapter_state),
+        "parameter_count": int(sum(tensor.numel() for tensor in adapter_state.values())),
+        "max_abs_diff": max_abs_diff,
+    }
+
+
+def load_optimizer_state_strict(optimizer: torch.optim.Optimizer, path: Path) -> dict[str, Any]:
+    state = torch_load(path)
+    if not isinstance(state, dict) or "state" not in state or "param_groups" not in state:
+        raise RuntimeError(f"Invalid optimizer checkpoint: {path}")
+    current = optimizer.state_dict()
+    if len(current["param_groups"]) != len(state["param_groups"]):
+        raise RuntimeError(
+            f"Optimizer param group count mismatch: checkpoint={len(state['param_groups'])} "
+            f"current={len(current['param_groups'])}"
+        )
+    for idx, (current_group, checkpoint_group) in enumerate(zip(current["param_groups"], state["param_groups"])):
+        if len(current_group["params"]) != len(checkpoint_group["params"]):
+            raise RuntimeError(
+                f"Optimizer param count mismatch in group {idx}: "
+                f"checkpoint={len(checkpoint_group['params'])} current={len(current_group['params'])}"
+            )
+    optimizer.load_state_dict(state)
+    return {
+        "optimizer_path": str(path),
+        "param_groups": len(state["param_groups"]),
+        "state_entries": len(state["state"]),
+    }
+
+
+def load_scheduler_state_strict(scheduler: Any, path: Path, resume_step: int) -> dict[str, Any]:
+    state = torch_load(path)
+    if not isinstance(state, dict):
+        raise RuntimeError(f"Invalid scheduler checkpoint: {path}")
+    scheduler.load_state_dict(state)
+    if int(getattr(scheduler, "last_epoch", -1)) != int(resume_step):
+        raise RuntimeError(f"Scheduler last_epoch mismatch after load: {scheduler.last_epoch} != {resume_step}")
+    return {
+        "scheduler_path": str(path),
+        "last_epoch": int(scheduler.last_epoch),
+        "last_lr": [float(value) for value in scheduler.get_last_lr()],
+    }
+
+
+def capture_rng_state() -> dict[str, Any]:
+    state = {
+        "python_random_state": random.getstate(),
+        "torch_cpu_rng_state": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state_if_present(path: Path | None) -> dict[str, Any]:
+    if path is None or not path.is_file():
+        return {"restored": False, "reason": "rng_state.pt not present in checkpoint"}
+    state = torch_load_full(path)
+    if "python_random_state" in state:
+        random.setstate(state["python_random_state"])
+    if "torch_cpu_rng_state" in state:
+        torch.set_rng_state(state["torch_cpu_rng_state"])
+    if torch.cuda.is_available() and "torch_cuda_rng_state_all" in state:
+        torch.cuda.set_rng_state_all(state["torch_cuda_rng_state_all"])
+    return {"restored": True, "path": str(path)}
+
+
+def make_data_iterator_at_cursor(
+    dataloader: torch.utils.data.DataLoader,
+    sampler: DistributedSampler | None,
+    cursor: dict[str, int],
+) -> tuple[Any, int]:
+    data_epoch = int(cursor["data_epoch"])
+    data_offset = int(cursor["data_offset"])
+    if sampler is not None:
+        sampler.set_epoch(data_epoch)
+    data_iter = iter(dataloader)
+    for _ in range(data_offset):
+        try:
+            next(data_iter)
+        except StopIteration as exc:
+            raise RuntimeError(f"Could not advance dataloader to resume offset {data_offset}") from exc
+    return data_iter, data_epoch
+
+
 def shared_step(
     transformer: torch.nn.Module,
     ref_transformer: torch.nn.Module,
@@ -457,10 +666,12 @@ def save_checkpoint(
     state: dict[str, Any],
     resolved_config: dict[str, Any],
 ) -> None:
+    ensure_checkpoint_save_target_safe(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     transformer.save_pretrained(checkpoint_dir)
     torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
     torch.save(scheduler.state_dict(), checkpoint_dir / "scheduler.pt")
+    torch.save(capture_rng_state(), checkpoint_dir / "rng_state.pt")
     write_json(checkpoint_dir / "trainer_state.json", state)
     write_yaml(checkpoint_dir / "config_resolved.yaml", resolved_config)
 
@@ -478,6 +689,13 @@ def train(args: argparse.Namespace) -> None:
         output_dir = Path(args.output_dir or run_dir).expanduser().resolve()
         checkpoint_root = output_dir / "checkpoints"
         is_main = bool(dist_state["is_main"])
+        resume_checkpoint = resolve_resume_checkpoint(args, checkpoint_root)
+        resume_files = None
+        resume_step = 0
+        resume_trainer_state: dict[str, Any] | None = None
+        resume_scheduler_state: dict[str, Any] | None = None
+        resume_config_report: dict[str, Any] | None = None
+        resume_report: dict[str, Any] = {"enabled": resume_checkpoint is not None}
 
         def log(*items: object) -> None:
             if is_main:
@@ -498,6 +716,27 @@ def train(args: argparse.Namespace) -> None:
         log(f"  max_steps={cfg['max_steps']}")
         effective_batch = int(cfg["batch_size"]) * int(cfg["accumulate_grad_batches"]) * int(dist_state["world_size"])
         log(f"  effective_global_batch_size={effective_batch}")
+        if resume_checkpoint is not None:
+            log(f"  resume_checkpoint={resume_checkpoint}")
+            resume_files = validate_checkpoint_manifest(resume_checkpoint)
+            checkpoint_config = read_resume_yaml(resume_files["config_resolved"])
+            assert isinstance(checkpoint_config, dict)
+            resume_config_report = validate_resume_config(cfg_all, checkpoint_config)
+            resume_trainer_state = read_resume_json(resume_files["trainer_state"])
+            resume_scheduler_state = torch_load(resume_files["scheduler"])
+            assert isinstance(resume_trainer_state, dict)
+            assert isinstance(resume_scheduler_state, dict)
+            resume_step = validate_resume_metadata(resume_checkpoint, resume_trainer_state, resume_scheduler_state)
+            if resume_step >= int(cfg["max_steps"]):
+                raise ResumeError(f"Checkpoint step {resume_step} is already >= max_steps {cfg['max_steps']}")
+            resume_report.update(
+                {
+                    "checkpoint": str(resume_checkpoint),
+                    "resume_step": resume_step,
+                    "next_step": resume_step + 1,
+                    "config": resume_config_report,
+                }
+            )
 
         if "test_t2v" in str(metadata_path) or "test_i2v" in str(metadata_path):
             raise ValueError(f"Refusing test metadata: {metadata_path}")
@@ -525,6 +764,9 @@ def train(args: argparse.Namespace) -> None:
         transformer.to(device)
         if cfg.get("enable_gradient_checkpointing"):
             enable_gradient_checkpointing(transformer)
+        if resume_files is not None:
+            adapter_report = load_lora_adapter_strict(transformer, resume_files["adapter_model"])
+            resume_report["adapter"] = adapter_report
         stats = trainable_stats(transformer)
         log("LoRA target modules:", cfg["lora_target_modules"])
         log("Trainable parameter count:", stats["trainable_params"])
@@ -552,6 +794,8 @@ def train(args: argparse.Namespace) -> None:
         ref_transformer.to(device=device, dtype=torch.bfloat16)
         ref_transformer.requires_grad_(False)
         ref_transformer.eval()
+        if any("lora_" in name for name, _param in ref_transformer.named_parameters()):
+            raise RuntimeError("Reference model unexpectedly contains LoRA parameters")
         transformer.train()
 
         loss_fn = create_loss_strategy(strategy="dpo", beta=float(cfg["beta"]))
@@ -561,16 +805,41 @@ def train(args: argparse.Namespace) -> None:
             num_warmup_steps=int(cfg["warmup_steps"]),
             num_training_steps=int(cfg["max_steps"]),
         )
+        if resume_files is not None:
+            optimizer_report = load_optimizer_state_strict(optimizer, resume_files["optimizer"])
+            scheduler_report = load_scheduler_state_strict(scheduler, resume_files["scheduler"], resume_step)
+            resume_report["optimizer"] = optimizer_report
+            resume_report["scheduler"] = scheduler_report
+            resume_report["reference_model"] = {"has_lora_parameters": False, "requires_grad": False}
 
         ref_before = sample_frozen(ref_transformer)
         metrics = []
         grad_nonzero = False
-        step = 0
-        data_epoch = 0
-        if sampler is not None:
-            sampler.set_epoch(data_epoch)
-        data_iter = iter(dataloader)
         accum_steps = max(1, int(cfg["accumulate_grad_batches"]))
+        step = resume_step
+        if resume_files is not None:
+            cursor = compute_resume_data_cursor(step, accum_steps, len(dataloader))
+            data_iter, data_epoch = make_data_iterator_at_cursor(dataloader, sampler, cursor)
+            rng_report = restore_rng_state_if_present(resume_files["rng_state"])
+            resume_report["data_cursor"] = cursor
+            resume_report["rng"] = rng_report
+            resume_report["first_new_update_step"] = step + 1
+            resume_report["next_checkpoint_step"] = ((step // int(cfg["save_steps"])) + 1) * int(cfg["save_steps"])
+            resume_report["current_lr_before_update"] = float(scheduler.get_last_lr()[0])
+            if is_main:
+                print("Resume validation report:")
+                print(json.dumps(resume_report, indent=2, ensure_ascii=False))
+            distributed_barrier(dist_state)
+            if args.validate_resume_only:
+                if is_main:
+                    print("Validate-resume-only PASS. No backward, optimizer step, scheduler step, checkpoint save, or summary write was performed.")
+                distributed_barrier(dist_state)
+                return
+        else:
+            data_epoch = 0
+            if sampler is not None:
+                sampler.set_epoch(data_epoch)
+            data_iter = iter(dataloader)
 
         def next_batch() -> dict[str, Any]:
             nonlocal data_iter, data_epoch
@@ -636,9 +905,14 @@ def train(args: argparse.Namespace) -> None:
             if is_main:
                 metrics.append(row)
                 print(json.dumps(row, ensure_ascii=False))
-            if is_main and (step % int(cfg["save_steps"]) == 0 or step == int(cfg["max_steps"])):
+            should_save = step % int(cfg["save_steps"]) == 0 or step == int(cfg["max_steps"])
+            if should_save:
+                checkpoint_path = checkpoint_root / f"step_{step:06d}"
+                ensure_checkpoint_save_target_safe(checkpoint_path)
+                distributed_barrier(dist_state)
+            if is_main and should_save:
                 save_checkpoint(
-                    checkpoint_root / f"step_{step:06d}",
+                    checkpoint_path,
                     unwrap_model(transformer),
                     optimizer,
                     scheduler,
@@ -726,6 +1000,14 @@ def main() -> None:
     parser.add_argument("--output_dir", default=None)
     parser.add_argument("--max_train_steps", type=int, default=None)
     parser.add_argument("--device", type=int, default=None)
+    parser.add_argument("--resume", action="store_true", help="Resume from the latest complete checkpoint under output_dir/checkpoints")
+    parser.add_argument("--resume_from_checkpoint", "--resume-from-checkpoint", default=None)
+    parser.add_argument(
+        "--validate_resume_only",
+        "--validate-resume-only",
+        action="store_true",
+        help="Load model/optimizer/scheduler/data cursor for resume validation, then exit without training or writing outputs",
+    )
     args = parser.parse_args()
     train(args)
 
