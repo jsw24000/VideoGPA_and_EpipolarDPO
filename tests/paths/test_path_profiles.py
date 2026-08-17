@@ -74,3 +74,25 @@ def test_videogpa_formal_matrix_resolves_to_parallel_roots() -> None:
         )
         assert cluster.returncode == 0, cluster.stdout + cluster.stderr
         assert cluster.stdout.strip().endswith(f"/outputs/VideoGPA_and_EpipolarDPO/videogpa/{suffix}")
+
+
+def test_resolved_runtime_config_can_be_resolved_again(tmp_path: Path) -> None:
+    command = (
+        "source scripts/env/activate_profile.sh local >/dev/null && "
+        "python - <<'PY'\n"
+        "from pathlib import Path\n"
+        "from vgm_common.config import resolve_experiment_config, write_yaml\n"
+        f"tmp = Path({str(tmp_path)!r})\n"
+        "first = resolve_experiment_config('configs/videogpa/wan22_5b_t2v_formal.yaml', tmp / 'run')\n"
+        "resolved = tmp / 'config_resolved.yaml'\n"
+        "write_yaml(resolved, first)\n"
+        "second = resolve_experiment_config(resolved, tmp / 'eval')\n"
+        "print(second['data']['manifest_relpath'])\n"
+        "print(second['paths']['train_manifest'])\n"
+        "PY"
+    )
+    proc = run_bash(command)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    lines = proc.stdout.strip().splitlines()
+    assert lines[0] == "manifests/videogpa_protocol/train_t2v.json"
+    assert lines[1] == str(REPO_ROOT / "data" / "manifests" / "videogpa_protocol" / "train_t2v.json")

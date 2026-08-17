@@ -139,7 +139,8 @@ def resolve_experiment_config(
     )
 
     data_cfg = cfg["data"]
-    data_cfg.setdefault("manifest_relpath", _legacy_manifest_relpath(cfg["paths"].get("train_manifest")))
+    if "manifest_relpath" not in data_cfg:
+        data_cfg["manifest_relpath"] = _legacy_manifest_relpath(cfg["paths"].get("train_manifest"))
     data_cfg.setdefault("first_frames_relroot", "first_frames")
     manifest_path = resolve_data_path(data_cfg["manifest_relpath"])
     first_frames_root = resolve_data_path(data_cfg["first_frames_relroot"])
