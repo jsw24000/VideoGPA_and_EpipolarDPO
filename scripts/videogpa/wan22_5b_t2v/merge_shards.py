@@ -63,6 +63,7 @@ def merge_scored_pairs(
 ) -> None:
     scored_payloads = [read_json(path) for path in scored_inputs]
     scored = dict(scored_payloads[0]) if scored_payloads else {"task": "t2v"}
+    task = str(scored.get("task", "t2v"))
     groups: list[dict[str, Any]] = []
     for payload in scored_payloads:
         groups.extend(payload.get("groups", []))
@@ -81,7 +82,7 @@ def merge_scored_pairs(
         debug_fallback_used = debug_fallback_used or bool(payload.get("debug_fallback_used"))
 
     pair_payload = {
-        "task": "t2v",
+        "task": task,
         "base_path": scored.get("base_path"),
         "metric_name": scored_payloads[0].get("metric_name", "consistency_score") if scored_payloads else "consistency_score",
         "metric_mode": scored_payloads[0].get("metric_mode", "min") if scored_payloads else "min",

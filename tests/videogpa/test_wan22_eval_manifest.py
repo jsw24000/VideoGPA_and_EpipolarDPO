@@ -105,6 +105,87 @@ def test_task_manifests_keep_t2v_pure_and_i2v_conditioned(tmp_path: Path) -> Non
     assert not [text for text in iter_strings(i2v_payload) if text.startswith("/")]
 
 
+def test_eval_100_subset_is_seeded_and_reproducible(tmp_path: Path) -> None:
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    command = (
+        "source scripts/env/activate_profile.sh local >/dev/null && "
+        f"python scripts/videogpa/wan22_5b_eval/make_eval_manifest.py --output {first} --seed 456 --limit 100 && "
+        f"python scripts/videogpa/wan22_5b_eval/make_eval_manifest.py --output {second} --seed 456 --limit 100"
+    )
+    proc = run_bash(command)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    first_payload = json.loads(first.read_text(encoding="utf-8"))
+    second_payload = json.loads(second.read_text(encoding="utf-8"))
+    first_scene_ids = [sample["scene_uid"] for sample in first_payload["samples"]]
+    second_scene_ids = [sample["scene_uid"] for sample in second_payload["samples"]]
+    assert first_payload["num_samples"] == 100
+    assert first_payload["selection"] == {
+        "strategy": "seeded_without_replacement",
+        "seed": 456,
+        "requested_limit": 100,
+        "source_size": 1000,
+    }
+    assert first_scene_ids == second_scene_ids
+    assert len(first_scene_ids) == len(set(first_scene_ids)) == 100
+
+
+def test_eval_runner_manifest_only_uses_flat_100_sample_layout(tmp_path: Path) -> None:
+    run_dir = tmp_path / "wan22_5b_t2v_formal_001"
+    run_dir.mkdir()
+    (run_dir / "config_resolved.yaml").write_text(
+        "project:\n  method: videogpa\n  model_scale: 5b\n  task: t2v\n",
+        encoding="utf-8",
+    )
+    command = (
+        "source scripts/env/activate_profile.sh local >/dev/null && "
+        f"PYTHON_BIN=python bash scripts/videogpa/wan22_5b_eval/run_eval.sh --run-dir {run_dir} --manifest-only"
+    )
+    proc = run_bash(command)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    eval_dir = run_dir / "evaluation" / "dl3dv1k_seed456"
+    canonical = json.loads((eval_dir / "manifests/eval_1k_seed456.json").read_text(encoding="utf-8"))
+    task_manifest = json.loads((eval_dir / "manifests/task_eval_1k_seed456.json").read_text(encoding="utf-8"))
+    assert canonical["num_samples"] == task_manifest["num_samples"] == 100
+    assert task_manifest["task"] == "t2v"
+    assert not (eval_dir / "manifests/t2v_eval_1k_seed456.json").exists()
+
+    runner = (REPO_ROOT / "scripts/videogpa/wan22_5b_eval/run_eval.sh").read_text(encoding="utf-8")
+    assert 'local out_dir="${GEN_DIR}/${variant}"' in runner
+    assert 'local out_dir="${SCORE_DIR}/da3"' in runner
+    assert 'local base_dir="${GEN_DIR}/${task}/${variant}"' not in runner
+    assert 'assert_variant_video_count "${variant}" "${out_dir}"' in runner
+    assert '[[ -f "${adapter_dir}/adapter_model.safetensors" || -f "${adapter_dir}/adapter_model.bin" ]]' in runner
+    assert "Only one fine-tuned variant is allowed per RUN_DIR" in runner
+
+
+def test_eval_runner_discovers_inference_complete_legacy_checkpoint(tmp_path: Path) -> None:
+    run_dir = tmp_path / "wan22_5b_t2v_formal_001"
+    checkpoint = run_dir / "checkpoints/step_010000"
+    checkpoint.mkdir(parents=True)
+    (run_dir / "config_resolved.yaml").write_text(
+        "project:\n  method: videogpa\n  model_scale: 5b\n  task: t2v\n",
+        encoding="utf-8",
+    )
+    (checkpoint / "adapter_config.json").write_text("{}\n", encoding="utf-8")
+    (checkpoint / "adapter_model.safetensors").touch()
+
+    command = (
+        "source scripts/env/activate_profile.sh local >/dev/null && "
+        f"PYTHON_BIN=python bash scripts/videogpa/wan22_5b_eval/run_eval.sh --run-dir {run_dir} "
+        "--skip-baseline --skip-generation --skip-score"
+    )
+    proc = run_bash(command)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    environment = (
+        run_dir / "evaluation/dl3dv1k_seed456/config/environment.txt"
+    ).read_text(encoding="utf-8")
+    assert f"EVAL_VARIANT=videogpa_step_010000={checkpoint}:0.2" in environment
+
+
 def test_t2v_generator_marks_1k_dict_manifest_as_test(monkeypatch, tmp_path: Path) -> None:
     module = load_t2v_generator_module(monkeypatch)
     scene_uid = "1K/001dccbc1f78146a9f03861026613d8e73f39f372b545b26118e37a23c740d5f"

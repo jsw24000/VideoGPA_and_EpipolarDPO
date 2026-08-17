@@ -29,7 +29,6 @@ REQUIRED_REPO_PATHS = [
 
 REQUIRED_MANIFEST_PATHS = [
     "videogpa_protocol",
-    "videogpa_protocol/train_t2v.json",
 ]
 
 OPTIONAL_MANIFEST_PATHS = [
@@ -131,15 +130,33 @@ def audit_models(project_root: Path, resolved: dict) -> dict:
     wan = Path(resolved["paths"]["wan_model_path"])
     vggt = Path(resolved["paths"]["vggt_model_path"])
     official_lora = project_root / "VideoGPA/checkpoints/VideoGPA-Wan2.2TI2V-lora"
+    model_cfg = resolved.get("model", {}) if isinstance(resolved.get("model"), dict) else {}
+    architecture = str(model_cfg.get("architecture", "single_ti2v_5b"))
+    vae_name = "Wan2.1_VAE.pth" if str(model_cfg.get("vae_version")) == "wan2_1" else "Wan2.2_VAE.pth"
     wan_files = {
-        "config_json": wan / "config.json",
-        "configuration_json": wan / "configuration.json",
-        "vae": wan / "Wan2.2_VAE.pth",
+        "vae": wan / vae_name,
         "t5": wan / "models_t5_umt5-xxl-enc-bf16.pth",
-        "dit_index": wan / "diffusion_pytorch_model.safetensors.index.json",
         "t5_tokenizer": wan / "google/umt5-xxl",
     }
+    if architecture == "dual_expert_a14b":
+        for expert in ("low_noise_model", "high_noise_model"):
+            expert_root = wan / expert
+            wan_files[f"{expert}_root"] = expert_root
+            wan_files[f"{expert}_config_json"] = expert_root / "config.json"
+            wan_files[f"{expert}_dit_index"] = expert_root / "diffusion_pytorch_model.safetensors.index.json"
+    else:
+        wan_files.update(
+            {
+                "config_json": wan / "config.json",
+                "configuration_json": wan / "configuration.json",
+                "dit_index": wan / "diffusion_pytorch_model.safetensors.index.json",
+            }
+        )
     dit_shards = sorted(wan.glob("diffusion_pytorch_model-*.safetensors"))
+    if architecture == "dual_expert_a14b":
+        dit_shards = sorted((wan / "low_noise_model").glob("diffusion_pytorch_model-*.safetensors")) + sorted(
+            (wan / "high_noise_model").glob("diffusion_pytorch_model-*.safetensors")
+        )
     vggt_files = {
         "config_json": vggt / "config.json",
         "model_safetensors": vggt / "model.safetensors",
@@ -147,6 +164,9 @@ def audit_models(project_root: Path, resolved: dict) -> dict:
     }
     return {
         "wan_root": str(wan),
+        "wan_task_key": model_cfg.get("wan_task_key"),
+        "architecture": architecture,
+        "vae_name": vae_name,
         "wan_required": {key: path.exists() for key, path in wan_files.items()},
         "wan_dit_shard_count": len(dit_shards),
         "wan_complete": all(path.exists() for path in wan_files.values()) and bool(dit_shards),
@@ -165,10 +185,8 @@ def audit_model_candidates(project_root: Path) -> dict:
     wan_candidates = [
         str(p.resolve())
         for p in iter_dirs_limited(models_root, max_depth=5)
-        if p.name == "Wan2.2-TI2V-5B"
-        and (p / "Wan2.2_VAE.pth").is_file()
+        if p.name.startswith("Wan2.2-")
         and (p / "models_t5_umt5-xxl-enc-bf16.pth").is_file()
-        and (p / "diffusion_pytorch_model.safetensors.index.json").is_file()
     ]
     vggt_candidates = [
         str(p.resolve())
@@ -180,7 +198,21 @@ def audit_model_candidates(project_root: Path) -> dict:
     return {"wan_candidates": sorted(wan_candidates), "vggt_candidates": sorted(vggt_candidates)}
 
 
-def audit_wan_defaults(project_root: Path) -> dict:
+def audit_wan_defaults(project_root: Path, resolved: dict) -> dict:
+    model_cfg = resolved.get("model", {}) if isinstance(resolved.get("model"), dict) else {}
+    if str(model_cfg.get("architecture")) == "dual_expert_a14b":
+        return {
+            "wan_task_key": str(model_cfg.get("wan_task_key")),
+            "architecture": "dual_expert_a14b",
+            "vae_version": str(model_cfg.get("vae_version")),
+            "generate_dispatch": "A14B generation uses WanT2V for T2V and WanI2V for I2V",
+            "config_size": str(resolved.get("generation", {}).get("size")),
+            "config_frame_num": str(resolved.get("generation", {}).get("frame_num")),
+            "config_sample_steps": str(resolved.get("generation", {}).get("sampling_steps")),
+            "config_sample_shift": str(resolved.get("generation", {}).get("sample_shift")),
+            "config_sample_guide_scale": str(resolved.get("generation", {}).get("guide_scale")),
+            "config_sample_fps": str(resolved.get("generation", {}).get("fps")),
+        }
     textimage_path = project_root / "VideoGPA/Wan2.2/wan/textimage2video.py"
     config_path = project_root / "VideoGPA/Wan2.2/wan/configs/wan_ti2v_5B.py"
     text = textimage_path.read_text(encoding="utf-8")
@@ -232,10 +264,10 @@ def load_optional_jsonl(path: Path) -> list[dict]:
     return load_jsonl(path) if path.exists() else []
 
 
-def audit_manifest(project_root: Path, train_manifest: Path) -> dict:
+def audit_manifest(project_root: Path, train_manifest: Path, task: str) -> dict:
     data = read_json(train_manifest)
     if not isinstance(data, dict):
-        raise ValueError(f"Expected dict manifest for T2V train, got {type(data).__name__}")
+        raise ValueError(f"Expected dict manifest for {task.upper()} train, got {type(data).__name__}")
     manifest_root = get_manifest_root()
     master_path = manifest_root / "master_all.jsonl"
     caption_path = manifest_root / "caption_index.jsonl"
@@ -246,6 +278,7 @@ def audit_manifest(project_root: Path, train_manifest: Path) -> dict:
     source_counts: dict[str, int] = {}
     empty_prompts = []
     image_keys = []
+    image_key_count = 0
     traced_master = 0
     traced_caption = 0
     prompt_master = 0
@@ -259,9 +292,9 @@ def audit_manifest(project_root: Path, train_manifest: Path) -> dict:
         if not prompt.strip():
             empty_prompts.append(scene_uid)
         if isinstance(item, dict):
-            image_keys.extend(
-                (scene_uid, key) for key in item if "image" in key.lower() or "frame" in key.lower()
-            )
+            sample_image_keys = [key for key in item if "image" in key.lower() or "frame" in key.lower()]
+            image_key_count += len(sample_image_keys)
+            image_keys.extend((scene_uid, key) for key in sample_image_keys)
         master = master_by_uid.get(scene_uid)
         caption = caption_by_uid.get(scene_uid)
         if master:
@@ -281,10 +314,12 @@ def audit_manifest(project_root: Path, train_manifest: Path) -> dict:
         "caption_index_present": caption_path.exists(),
         "scene_id_field": "dict key scene_uid, formatted source_subset/scene_id",
         "prompt_field": "text_prompt",
+        "task": task,
         "source_counts": source_counts,
         "empty_prompt_count": len(empty_prompts),
         "duplicate_scene_id_count": duplicate_count,
         "image_related_key_examples": image_keys[:5],
+        "image_related_key_count": image_key_count,
         "trace_master_count": traced_master,
         "trace_caption_count": traced_caption,
         "prompt_exact_master_count": prompt_master,
@@ -348,7 +383,7 @@ def write_report(
     static: dict,
 ) -> None:
     lines = [
-        "# VideoGPA WAN2.2 5B T2V Smoke Preflight",
+        f"# VideoGPA WAN2.2 {resolved['project'].get('model_scale', '').upper()} {resolved['project'].get('task', '').upper()} Preflight",
         "",
         f"Status: {static['status']}",
         "",
@@ -418,6 +453,7 @@ def write_report(
             f"- empty_prompt_count: `{manifest['empty_prompt_count']}`",
             f"- duplicate_scene_id_count: `{manifest['duplicate_scene_id_count']}`",
             f"- image_related_key_examples: `{manifest['image_related_key_examples']}`",
+            f"- image_related_key_count: `{manifest['image_related_key_count']}`",
             f"- trace_master_count: `{manifest['trace_master_count']}`",
             f"- trace_caption_count: `{manifest['trace_caption_count']}`",
             f"- prompt_exact_master_count: `{manifest['prompt_exact_master_count']}`",
@@ -429,13 +465,13 @@ def write_report(
             f"- master_rows: `{manifest_samples['master_rows']}`",
             f"- caption_rows: `{manifest_samples['caption_rows']}`",
             "",
-            "First 5 train_t2v samples, sanitized:",
+            f"First 5 train_{manifest['task']} samples, sanitized:",
             "",
             "```json",
             json.dumps(manifest["first5_sanitized"], indent=2, ensure_ascii=False),
             "```",
             "",
-            "Important: this manifest is all train split but includes 8K/9K/10K/11K. Smoke subset creation filters `8K/` only and never reads test manifests.",
+            "Important: formal manifests are train split and include 8K/9K/10K/11K; subset creation must never read test manifests.",
             "",
             "## Code Diff Decisions",
             "",
@@ -467,6 +503,7 @@ def main() -> None:
     run_dir = Path(args.run_dir).expanduser().resolve() if args.run_dir else None
     resolved = resolve_config(config_path, run_dir)
     project_root = Path(resolved["project"]["project_root"])
+    task = str(resolved.get("project", {}).get("task", "t2v")).lower()
     run_dir = Path(resolved["paths"].get("run_dir") or Path(resolved["paths"]["output_root"]) / "preflight_only")
 
     manifest_root = get_manifest_root()
@@ -479,8 +516,8 @@ def main() -> None:
     runtime = audit_runtime_tools(project_root)
     model_audit = audit_models(project_root, resolved)
     candidate_audit = audit_model_candidates(project_root)
-    wan_defaults = audit_wan_defaults(project_root)
-    manifest = audit_manifest(project_root, Path(resolved["paths"]["train_manifest"]))
+    wan_defaults = audit_wan_defaults(project_root, resolved)
+    manifest = audit_manifest(project_root, Path(resolved["paths"]["train_manifest"]), task)
     manifest_samples = audit_manifest_samples(project_root)
     branch = run_text(["git", "branch", "--show-current"], project_root)
     commit = run_text(["git", "rev-parse", "HEAD"], project_root)
@@ -505,28 +542,28 @@ def main() -> None:
     if not model_audit["vggt_complete"]:
         ready = False
         caveats.append("VGGT model incomplete")
-    if len(candidate_audit["wan_candidates"]) != 1:
-        ready = False
-        caveats.append("WAN model auto-discovery is ambiguous or missing")
     if len(candidate_audit["vggt_candidates"]) != 1:
         ready = False
         caveats.append("VGGT model auto-discovery is ambiguous or missing")
     if manifest["empty_prompt_count"]:
         ready = False
-        caveats.append("empty prompts in train_t2v")
-    if manifest["image_related_key_examples"]:
+        caveats.append(f"empty prompts in train_{task}")
+    if task == "t2v" and manifest["image_related_key_examples"]:
         ready = False
         caveats.append("unexpected image keys in train_t2v")
+    if task == "i2v" and manifest["image_related_key_count"] <= 0:
+        ready = False
+        caveats.append("missing image/first-frame keys in train_i2v")
     expected_train_prompts = resolved.get("formal_requirements", {}).get("expected_train_prompts")
     if expected_train_prompts is not None and manifest["total_samples"] != int(expected_train_prompts):
         ready = False
         caveats.append(
-            f"train_t2v sample count {manifest['total_samples']} != expected {int(expected_train_prompts)}"
+            f"train_{task} sample count {manifest['total_samples']} != expected {int(expected_train_prompts)}"
         )
     if manifest["master_manifest_present"] and manifest["trace_master_count"] != manifest["total_samples"]:
         ready = False
         caveats.append(
-            f"master_all trace count {manifest['trace_master_count']} != train_t2v count {manifest['total_samples']}"
+            f"master_all trace count {manifest['trace_master_count']} != train_{task} count {manifest['total_samples']}"
         )
 
     static = {

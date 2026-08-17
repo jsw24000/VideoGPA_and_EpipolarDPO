@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import random
 from pathlib import Path
 from typing import Any
 
@@ -93,10 +94,18 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
     master_rows = read_jsonl(master_path)
     master_by_uid = {row["scene_uid"]: row for row in master_rows}
     limit = parse_limit(args.limit)
+    manifest_items = list(test_t2v.items())
+    if limit is None:
+        selected_indices = list(range(len(manifest_items)))
+        selection_strategy = "full_manifest_order"
+    else:
+        if limit > len(manifest_items):
+            raise ValueError(f"--limit={limit} exceeds available samples={len(manifest_items)}")
+        selected_indices = sorted(random.Random(int(args.seed)).sample(range(len(manifest_items)), limit))
+        selection_strategy = "seeded_without_replacement"
     samples: list[dict[str, Any]] = []
-    for index, (scene_uid, t2v_item) in enumerate(test_t2v.items()):
-        if limit is not None and len(samples) >= limit:
-            break
+    for index in selected_indices:
+        scene_uid, t2v_item = manifest_items[index]
         i2v_item = test_i2v[scene_uid]
         t2v_prompt = str(t2v_item.get("text_prompt", "")).strip()
         i2v_prompt = str(i2v_item.get("text_prompt", "")).strip()
@@ -149,6 +158,12 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         "seed": int(args.seed),
         "seeds": [int(args.seed)],
         "num_samples": len(samples),
+        "selection": {
+            "strategy": selection_strategy,
+            "seed": int(args.seed),
+            "requested_limit": "all" if limit is None else limit,
+            "source_size": len(manifest_items),
+        },
         "generation_settings": {
             "frame_num": 81,
             "size": "1280*704",

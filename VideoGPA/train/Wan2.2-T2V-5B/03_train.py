@@ -1,12 +1,9 @@
 """
-Wan2.2 TI2V-5B text-only VideoGPA DPO LoRA smoke trainer.
+WAN2.2 VideoGPA DPO LoRA trainer.
 
-This sibling keeps the official WAN VideoGPA DPO ingredients while removing the
-TI2V image-conditioned first-frame path. It intentionally uses a direct PyTorch
-loop for smoke execution because the local runnable environment does not include
-the optional Lightning/W&B orchestration packages used by the official script.
-The DPO loss, reference-policy comparison, flow-matching target, LoRA modules,
-and optimizer/scheduler choices remain aligned with the official WAN script.
+The entrypoint keeps the original 5B T2V checkpoint layout intact, and adds
+config-driven support for 5B TI2V first-frame conditioning plus 14B dual-expert
+T2V/I2V LoRA adapters.
 """
 
 from __future__ import annotations
@@ -62,6 +59,7 @@ from resume_utils import (  # noqa: E402
     validate_resume_metadata,
 )
 from wan.modules.model import WanModel  # noqa: E402
+from wan.configs import WAN_CONFIGS  # noqa: E402
 
 
 DEFAULT_CONFIG = {
@@ -85,6 +83,10 @@ DEFAULT_CONFIG = {
     "lora_target_modules": ["q", "k", "v", "o"],
     "vae_stride": (4, 16, 16),
     "patch_size": (1, 2, 2),
+    "boundary": 0.875,
+    "architecture": "single_ti2v_5b",
+    "task": "t2v",
+    "wan_task_key": "ti2v-5B",
     "enable_gradient_checkpointing": True,
     "seed": 2026,
     "device": 0,
@@ -168,7 +170,20 @@ def resolve_config(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--config is required so paths can be resolved through the active VGM profile")
     cfg = resolve_experiment_config(args.config, args.run_dir, model_path_override=args.model_path)
     cfg.setdefault("training", {})
-    cfg["project"]["task"] = "t2v"
+    cfg.setdefault("project", {})
+    cfg.setdefault("model", {})
+    task = str(cfg["project"].get("task", "t2v")).lower()
+    if task not in {"t2v", "i2v"}:
+        raise ValueError(f"Unsupported training task: {task!r}")
+    cfg["project"]["task"] = task
+    model_cfg = cfg.get("model", {})
+    wan_task_key = str(model_cfg.get("wan_task_key", "ti2v-5B"))
+    if wan_task_key not in WAN_CONFIGS:
+        raise ValueError(f"Unknown WAN task key {wan_task_key!r}; available={sorted(WAN_CONFIGS)}")
+    wan_cfg = WAN_CONFIGS[wan_task_key]
+    architecture = str(model_cfg.get("architecture", "single_ti2v_5b"))
+    if architecture not in {"single_ti2v_5b", "dual_expert_a14b"}:
+        raise ValueError(f"Unsupported WAN architecture: {architecture!r}")
     train_cfg = DEFAULT_CONFIG.copy()
     yaml_train = cfg.get("training", {})
     train_cfg.update(
@@ -203,6 +218,20 @@ def resolve_config(args: argparse.Namespace) -> dict[str, Any]:
             "enable_gradient_checkpointing": yaml_train.get(
                 "enable_gradient_checkpointing", train_cfg["enable_gradient_checkpointing"]
             ),
+        }
+    )
+    if "num_train_timesteps" not in yaml_train and hasattr(wan_cfg, "num_train_timesteps"):
+        train_cfg["num_train_timesteps"] = int(wan_cfg.num_train_timesteps)
+    if "shift" not in yaml_train and hasattr(wan_cfg, "sample_shift"):
+        train_cfg["shift"] = float(wan_cfg.sample_shift)
+    train_cfg.update(
+        {
+            "task": task,
+            "architecture": architecture,
+            "wan_task_key": wan_task_key,
+            "vae_stride": tuple(wan_cfg.vae_stride),
+            "patch_size": tuple(wan_cfg.patch_size),
+            "boundary": float(getattr(wan_cfg, "boundary", train_cfg["boundary"])),
         }
     )
     if args.max_train_steps:
@@ -294,6 +323,102 @@ def compute_seq_len(z: torch.Tensor, patch_size: tuple[int, int, int]) -> int:
     return f * (h // patch_size[1]) * (w // patch_size[2])
 
 
+def is_dual_expert(cfg: dict[str, Any]) -> bool:
+    return str(cfg.get("architecture", "")) == "dual_expert_a14b"
+
+
+def checkpoint_is_dual(resume_files: dict[str, Any] | None) -> bool:
+    if resume_files is None:
+        return False
+    dual_models = resume_files.get("dual_adapter_models")
+    return isinstance(dual_models, dict) and all(dual_models.get(name) for name in ("low_noise_model", "high_noise_model"))
+
+
+def create_ti2v_mask(reference: torch.Tensor) -> torch.Tensor:
+    mask = torch.ones_like(reference)
+    mask[:, :, 0, :, :] = 0
+    return mask
+
+
+def apply_clean_first_latent(noisy: torch.Tensor, image_latent: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    return (1.0 - mask) * image_latent + mask * noisy
+
+
+def create_ti2v_timestep_tensor(
+    timesteps: torch.Tensor,
+    mask: torch.Tensor,
+    seq_len: int,
+    patch_size: tuple[int, int, int],
+) -> torch.Tensor:
+    patch_h, patch_w = patch_size[1], patch_size[2]
+    token_mask = mask[:, 0, :, ::patch_h, ::patch_w].flatten(1)
+    timestep_values = timesteps.view(-1, 1).to(dtype=token_mask.dtype)
+    expanded = token_mask * timestep_values
+    if expanded.shape[1] < seq_len:
+        pad = timestep_values.expand(-1, seq_len - expanded.shape[1])
+        expanded = torch.cat([expanded, pad], dim=1)
+    if expanded.shape[1] > seq_len:
+        expanded = expanded[:, :seq_len]
+    return expanded.to(device=timesteps.device)
+
+
+class DualExpertModel(torch.nn.Module):
+    def __init__(
+        self,
+        low_noise_model: torch.nn.Module,
+        high_noise_model: torch.nn.Module,
+        boundary: float,
+        num_train_timesteps: int,
+    ) -> None:
+        super().__init__()
+        self.low_noise_model = low_noise_model
+        self.high_noise_model = high_noise_model
+        self.boundary = float(boundary)
+        self.num_train_timesteps = int(num_train_timesteps)
+
+    def forward(
+        self,
+        x: list[torch.Tensor],
+        t: torch.Tensor,
+        context: list[torch.Tensor],
+        seq_len: int,
+        y: list[torch.Tensor] | None = None,
+    ) -> list[torch.Tensor]:
+        t_scalar = t[:, 0] if t.dim() > 1 else t
+        high_mask = t_scalar >= self.boundary * self.num_train_timesteps
+        outputs: list[torch.Tensor | None] = [None] * len(x)
+
+        def run_subset(model: torch.nn.Module, indices: torch.Tensor) -> None:
+            if indices.numel() == 0:
+                return
+            idx_list = [int(value) for value in indices.detach().cpu().tolist()]
+            kwargs: dict[str, Any] = {
+                "t": t.index_select(0, indices),
+                "context": [context[idx] for idx in idx_list],
+                "seq_len": seq_len,
+            }
+            if y is not None:
+                kwargs["y"] = [y[idx] for idx in idx_list]
+            subset_out = model([x[idx] for idx in idx_list], **kwargs)
+            for idx, value in zip(idx_list, subset_out):
+                outputs[idx] = value
+
+        all_indices = torch.arange(len(x), device=t_scalar.device)
+        run_subset(self.high_noise_model, all_indices[high_mask])
+        run_subset(self.low_noise_model, all_indices[~high_mask])
+        if any(value is None for value in outputs):
+            raise RuntimeError("Dual expert routing failed to produce every sample")
+        return [value for value in outputs if value is not None]
+
+
+def enable_model_gradient_checkpointing(model: torch.nn.Module) -> None:
+    if isinstance(model, DualExpertModel):
+        enable_gradient_checkpointing(model.low_noise_model)
+        enable_gradient_checkpointing(model.high_noise_model)
+    else:
+        enable_gradient_checkpointing(model)
+
+
 def enable_gradient_checkpointing(model: torch.nn.Module) -> None:
     base = model.base_model.model if hasattr(model, "base_model") else model
     for block in base.blocks:
@@ -359,18 +484,26 @@ def sample_frozen(model: torch.nn.Module, limit: int = 16) -> dict[str, torch.Te
     return out
 
 
-def ensure_encoded_conditions_no_image(run_dir: Path, metadata_path: Path) -> None:
+def validate_encoded_conditions(run_dir: Path, metadata_path: Path, cfg: dict[str, Any]) -> None:
     payload = read_json(metadata_path)
     pairs = payload.get("pairs", [])
     if not pairs:
         raise ValueError("encoded manifest contains no pairs")
+    task = str(cfg.get("task", "t2v"))
+    architecture = str(cfg.get("architecture", "single_ti2v_5b"))
     for pair in pairs:
         cond = torch_load(run_dir / pair["condition_path"])
-        if "image_latent" in cond:
-            raise ValueError(f"T2V condition contains image_latent: {pair['condition_path']}")
         emb = cond.get("encoder_hidden_states")
         if not isinstance(emb, torch.Tensor) or emb.numel() == 0:
             raise ValueError(f"Invalid text embedding in {pair['condition_path']}")
+        has_image_latent = isinstance(cond.get("image_latent"), torch.Tensor)
+        has_i2v_y = isinstance(cond.get("i2v_y"), torch.Tensor)
+        if task == "t2v" and (has_image_latent or has_i2v_y):
+            raise ValueError(f"T2V condition contains image conditioning: {pair['condition_path']}")
+        if task == "i2v" and architecture == "single_ti2v_5b" and not has_image_latent:
+            raise ValueError(f"5B I2V condition missing image_latent: {pair['condition_path']}")
+        if task == "i2v" and architecture == "dual_expert_a14b" and not has_i2v_y:
+            raise ValueError(f"A14B I2V condition missing i2v_y: {pair['condition_path']}")
 
 
 def build_dataloader(run_dir: Path, metadata_path: Path, cfg: dict[str, Any], dist_state: dict[str, int | bool]):
@@ -602,11 +735,13 @@ def shared_step(
     batch: dict[str, Any],
     cfg: dict[str, Any],
     device: torch.device,
-) -> tuple[Any, dict[str, float]]:
+) -> tuple[Any, dict[str, Any]]:
     x_win = batch["x_win"].to(device=device, dtype=torch.bfloat16)
     x_lose = batch["x_lose"].to(device=device, dtype=torch.bfloat16)
     prompt_emb = batch["prompt_emb"].to(device=device, dtype=torch.bfloat16)
-    if "image_latent" in batch or "image_emb" in batch:
+    task = str(cfg.get("task", "t2v"))
+    architecture = str(cfg.get("architecture", "single_ti2v_5b"))
+    if task == "t2v" and any(key in batch for key in ("image_latent", "image_emb", "i2v_y")):
         raise ValueError("T2V training batch unexpectedly contains image condition")
 
     batch_size = x_win.shape[0]
@@ -618,16 +753,44 @@ def shared_step(
 
     x_win_noisy = flow_matching_add_noise(x_win, noise, sigma)
     x_lose_noisy = flow_matching_add_noise(x_lose, noise, sigma)
+    t_model = timesteps
+    y_list: list[torch.Tensor] | None = None
+    image_latent_shape: list[int] | None = None
+    i2v_y_shape: list[int] | None = None
+    if task == "i2v" and architecture == "single_ti2v_5b":
+        if "image_latent" not in batch:
+            raise ValueError("5B I2V training requires image_latent in encoded batch")
+        image_latent = batch["image_latent"].to(device=device, dtype=torch.bfloat16)
+        mask = create_ti2v_mask(x_win_noisy)
+        x_win_noisy = apply_clean_first_latent(x_win_noisy, image_latent, mask)
+        x_lose_noisy = apply_clean_first_latent(x_lose_noisy, image_latent, mask)
+        t_model = create_ti2v_timestep_tensor(timesteps, mask, seq_len, patch_size)
+        image_latent_shape = list(image_latent.shape)
+    elif task == "i2v" and architecture == "dual_expert_a14b":
+        if "i2v_y" not in batch:
+            raise ValueError("A14B I2V training requires i2v_y in encoded batch")
+        i2v_y = batch["i2v_y"].to(device=device, dtype=torch.bfloat16)
+        y_list = [i2v_y[b] for b in range(batch_size)]
+        i2v_y_shape = list(i2v_y.shape)
+    elif task == "i2v":
+        raise ValueError(f"Unsupported I2V architecture: {architecture}")
     context_list = [prompt_emb[b] for b in range(batch_size)]
     x_win_input = [x_win_noisy[b] for b in range(batch_size)]
     x_lose_input = [x_lose_noisy[b] for b in range(batch_size)]
+    common_kwargs: dict[str, Any] = {
+        "t": t_model,
+        "context": context_list,
+        "seq_len": seq_len,
+    }
+    if y_list is not None:
+        common_kwargs["y"] = y_list
 
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-        v_win_ref = torch.stack(ref_transformer(x_win_input, t=timesteps, context=context_list, seq_len=seq_len))
-        v_lose_ref = torch.stack(ref_transformer(x_lose_input, t=timesteps, context=context_list, seq_len=seq_len))
+        v_win_ref = torch.stack(ref_transformer(x_win_input, **common_kwargs))
+        v_lose_ref = torch.stack(ref_transformer(x_lose_input, **common_kwargs))
     with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-        v_win_pred = torch.stack(transformer(x_win_input, t=timesteps, context=context_list, seq_len=seq_len))
-        v_lose_pred = torch.stack(transformer(x_lose_input, t=timesteps, context=context_list, seq_len=seq_len))
+        v_win_pred = torch.stack(transformer(x_win_input, **common_kwargs))
+        v_lose_pred = torch.stack(transformer(x_lose_input, **common_kwargs))
 
     v_win_target = flow_matching_get_velocity(x_win.float(), noise.float())
     v_lose_target = flow_matching_get_velocity(x_lose.float(), noise.float())
@@ -654,8 +817,98 @@ def shared_step(
         "noise_shape": list(noise.shape),
         "text_embedding_shape": list(prompt_emb.shape),
         "seq_len": seq_len,
+        "task": task,
+        "architecture": architecture,
     }
+    if image_latent_shape is not None:
+        debug["image_latent_shape"] = image_latent_shape
+    if i2v_y_shape is not None:
+        debug["i2v_y_shape"] = i2v_y_shape
     return loss_out, debug
+
+
+def load_lora_adapters_for_model(model: torch.nn.Module, resume_files: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(model, DualExpertModel):
+        dual_models = resume_files.get("dual_adapter_models")
+        if not isinstance(dual_models, dict):
+            raise RuntimeError("Dual expert resume checkpoint is missing dual_adapter_models")
+        return {
+            "low_noise_model": load_lora_adapter_strict(model.low_noise_model, Path(dual_models["low_noise_model"])),
+            "high_noise_model": load_lora_adapter_strict(model.high_noise_model, Path(dual_models["high_noise_model"])),
+        }
+    adapter_model = resume_files.get("adapter_model")
+    if adapter_model is None:
+        raise RuntimeError("Single-expert resume checkpoint is missing adapter_model")
+    return load_lora_adapter_strict(model, Path(adapter_model))
+
+
+def save_model_adapters(model: torch.nn.Module, checkpoint_dir: Path) -> None:
+    if isinstance(model, DualExpertModel):
+        model.low_noise_model.save_pretrained(checkpoint_dir / "low_noise_model")
+        model.high_noise_model.save_pretrained(checkpoint_dir / "high_noise_model")
+    else:
+        model.save_pretrained(checkpoint_dir)
+
+
+def assert_checkpoint_adapter_layout(checkpoint_dir: Path, cfg: dict[str, Any]) -> None:
+    if is_dual_expert(cfg):
+        missing = []
+        for expert in ("low_noise_model", "high_noise_model"):
+            expert_dir = checkpoint_dir / expert
+            if not (expert_dir / "adapter_config.json").is_file():
+                missing.append(f"{expert}/adapter_config.json")
+            if not any((expert_dir / name).is_file() for name in ("adapter_model.safetensors", "adapter_model.bin")):
+                missing.append(f"{expert}/adapter_model")
+        if missing:
+            raise RuntimeError(f"Missing dual adapter checkpoint file(s) in {checkpoint_dir}: {', '.join(missing)}")
+    elif not (checkpoint_dir / "adapter_config.json").exists():
+        raise RuntimeError(f"Missing adapter_config.json in {checkpoint_dir}")
+
+
+def reload_checkpoint_smoke(model_path: Path, checkpoint_dir: Path, cfg: dict[str, Any]) -> None:
+    if is_dual_expert(cfg):
+        wan_cfg = WAN_CONFIGS[str(cfg["wan_task_key"])]
+        low_base = WanModel.from_pretrained(str(model_path), subfolder=wan_cfg.low_noise_checkpoint)
+        high_base = WanModel.from_pretrained(str(model_path), subfolder=wan_cfg.high_noise_checkpoint)
+        low_reloaded = PeftModel.from_pretrained(low_base, str(checkpoint_dir / "low_noise_model"), adapter_name="default")
+        high_reloaded = PeftModel.from_pretrained(high_base, str(checkpoint_dir / "high_noise_model"), adapter_name="default")
+        del low_reloaded, high_reloaded, low_base, high_base
+        return
+    reload_base = WanModel.from_pretrained(str(model_path))
+    reloaded = PeftModel.from_pretrained(reload_base, str(checkpoint_dir), adapter_name="default")
+    del reloaded, reload_base
+
+
+def build_policy_model(model_path: Path, cfg: dict[str, Any], lora_config: LoraConfig, device: torch.device) -> torch.nn.Module:
+    if is_dual_expert(cfg):
+        wan_cfg = WAN_CONFIGS[str(cfg["wan_task_key"])]
+        low = WanModel.from_pretrained(str(model_path), subfolder=wan_cfg.low_noise_checkpoint)
+        high = WanModel.from_pretrained(str(model_path), subfolder=wan_cfg.high_noise_checkpoint)
+        low.to(device=device, dtype=torch.bfloat16)
+        high.to(device=device, dtype=torch.bfloat16)
+        low = get_peft_model(low, lora_config)
+        high = get_peft_model(high, lora_config)
+        return DualExpertModel(low, high, float(cfg["boundary"]), int(cfg["num_train_timesteps"])).to(device)
+    transformer = WanModel.from_pretrained(str(model_path))
+    transformer.to(device=device, dtype=torch.bfloat16)
+    transformer = get_peft_model(transformer, lora_config)
+    return transformer.to(device)
+
+
+def build_reference_model(model_path: Path, cfg: dict[str, Any], device: torch.device) -> torch.nn.Module:
+    if is_dual_expert(cfg):
+        wan_cfg = WAN_CONFIGS[str(cfg["wan_task_key"])]
+        low = WanModel.from_pretrained(str(model_path), subfolder=wan_cfg.low_noise_checkpoint)
+        high = WanModel.from_pretrained(str(model_path), subfolder=wan_cfg.high_noise_checkpoint)
+        low.to(device=device, dtype=torch.bfloat16)
+        high.to(device=device, dtype=torch.bfloat16)
+        model = DualExpertModel(low, high, float(cfg["boundary"]), int(cfg["num_train_timesteps"]))
+    else:
+        model = WanModel.from_pretrained(str(model_path))
+        model.to(device=device, dtype=torch.bfloat16)
+    model.requires_grad_(False)
+    model.eval()
+    return model
 
 
 def save_checkpoint(
@@ -668,7 +921,7 @@ def save_checkpoint(
 ) -> None:
     ensure_checkpoint_save_target_safe(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    transformer.save_pretrained(checkpoint_dir)
+    save_model_adapters(transformer, checkpoint_dir)
     torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
     torch.save(scheduler.state_dict(), checkpoint_dir / "scheduler.pt")
     torch.save(capture_rng_state(), checkpoint_dir / "rng_state.pt")
@@ -707,8 +960,11 @@ def train(args: argparse.Namespace) -> None:
         log(f"  metadata_path={metadata_path}")
         log(f"  checkpoint_root={checkpoint_root}")
         log("Training mode:")
-        log("  task=t2v")
-        log("  image-conditioned branch=false")
+        log(f"  task={cfg['task']}")
+        log(f"  architecture={cfg['architecture']}")
+        log(f"  wan_task_key={cfg['wan_task_key']}")
+        log(f"  image-conditioned branch={cfg['task'] == 'i2v'}")
+        log(f"  dual_expert={is_dual_expert(cfg)}")
         log(f"  distributed={dist_state['distributed']}")
         log(f"  world_size={dist_state['world_size']}")
         log(f"  dpo_beta={cfg['beta']}")
@@ -740,7 +996,7 @@ def train(args: argparse.Namespace) -> None:
 
         if "test_t2v" in str(metadata_path) or "test_i2v" in str(metadata_path):
             raise ValueError(f"Refusing test metadata: {metadata_path}")
-        ensure_encoded_conditions_no_image(run_dir, metadata_path)
+        validate_encoded_conditions(run_dir, metadata_path, cfg)
 
         set_seed(int(cfg["seed"]) + int(dist_state["rank"]))
         device = torch.device(f"cuda:{int(cfg['device'])}" if torch.cuda.is_available() else "cpu")
@@ -752,20 +1008,21 @@ def train(args: argparse.Namespace) -> None:
         log(f"DPO dataset pairs: {len(dataloader.dataset)}")
 
         log(f"Loading policy WanModel from {model_path}")
-        transformer = WanModel.from_pretrained(str(model_path))
-        transformer.to(device=device, dtype=torch.bfloat16)
         lora_config = LoraConfig(
             r=int(cfg["lora_rank"]),
             lora_alpha=float(cfg["lora_alpha"]),
             lora_dropout=float(cfg["lora_dropout"]),
             target_modules=list(cfg["lora_target_modules"]),
         )
-        transformer = get_peft_model(transformer, lora_config)
-        transformer.to(device)
+        transformer = build_policy_model(model_path, cfg, lora_config, device)
         if cfg.get("enable_gradient_checkpointing"):
-            enable_gradient_checkpointing(transformer)
+            enable_model_gradient_checkpointing(transformer)
         if resume_files is not None:
-            adapter_report = load_lora_adapter_strict(transformer, resume_files["adapter_model"])
+            if checkpoint_is_dual(resume_files) != is_dual_expert(cfg):
+                raise ResumeError(
+                    f"Checkpoint adapter layout does not match current architecture={cfg['architecture']}"
+                )
+            adapter_report = load_lora_adapters_for_model(transformer, resume_files)
             resume_report["adapter"] = adapter_report
         stats = trainable_stats(transformer)
         log("LoRA target modules:", cfg["lora_target_modules"])
@@ -781,7 +1038,8 @@ def train(args: argparse.Namespace) -> None:
         frozen_before = sample_frozen(transformer)
 
         if dist_state["distributed"]:
-            find_unused = os.environ.get("DDP_FIND_UNUSED_PARAMETERS", "0") == "1"
+            find_unused_default = "1" if is_dual_expert(cfg) else "0"
+            find_unused = os.environ.get("DDP_FIND_UNUSED_PARAMETERS", find_unused_default) == "1"
             transformer = DistributedDataParallel(
                 transformer,
                 device_ids=[int(dist_state["local_rank"])] if device.type == "cuda" else None,
@@ -790,10 +1048,7 @@ def train(args: argparse.Namespace) -> None:
             )
 
         log(f"Loading frozen reference WanModel from {model_path}")
-        ref_transformer = WanModel.from_pretrained(str(model_path))
-        ref_transformer.to(device=device, dtype=torch.bfloat16)
-        ref_transformer.requires_grad_(False)
-        ref_transformer.eval()
+        ref_transformer = build_reference_model(model_path, cfg, device)
         if any("lora_" in name for name, _param in ref_transformer.named_parameters()):
             raise RuntimeError("Reference model unexpectedly contains LoRA parameters")
         transformer.train()
@@ -950,8 +1205,7 @@ def train(args: argparse.Namespace) -> None:
                 raise RuntimeError("A sampled frozen base parameter changed")
             if ref_changed:
                 raise RuntimeError("A sampled reference parameter changed")
-            if not (final_ckpt / "adapter_config.json").exists():
-                raise RuntimeError(f"Missing adapter_config.json in {final_ckpt}")
+            assert_checkpoint_adapter_layout(final_ckpt, cfg)
 
         distributed_barrier(dist_state)
         del ref_transformer
@@ -961,16 +1215,17 @@ def train(args: argparse.Namespace) -> None:
 
         if is_main:
             print(f"Reloading checkpoint adapter from {final_ckpt}")
-            reload_base = WanModel.from_pretrained(str(model_path))
-            reloaded = PeftModel.from_pretrained(reload_base, str(final_ckpt), adapter_name="default")
-            del reloaded, reload_base
+            reload_checkpoint_smoke(model_path, final_ckpt, cfg)
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
             summary = {
                 "status": "PASS",
-                "task": "t2v",
-                "image_conditioned_branch": False,
+                "task": cfg["task"],
+                "architecture": cfg["architecture"],
+                "wan_task_key": cfg["wan_task_key"],
+                "image_conditioned_branch": cfg["task"] == "i2v",
+                "dual_expert": is_dual_expert(cfg),
                 "distributed": dist_state,
                 "effective_global_batch_size": effective_batch,
                 "steps": step,

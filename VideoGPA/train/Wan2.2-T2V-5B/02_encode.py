@@ -1,10 +1,11 @@
 """
-Wan2.2 TI2V-5B text-only VideoGPA DPO - Step 2: encode text conditions and video latents.
+WAN2.2 VideoGPA DPO - Step 2: encode text/image conditions and video latents.
 
-This file is a low-intrusion T2V sibling of ``Wan2.2-TI2V-5B/02_encode.py``.
-The WAN T5 tokenizer/text encoder, VAE, video normalization, and latent layout
-are preserved. The TI2V-only first-frame image condition is intentionally absent:
-no image path is read and no ``image_latent`` key is written.
+Task handling:
+- 5B T2V keeps the historical text-only condition files.
+- 5B I2V adds the TI2V first-frame ``image_latent`` condition.
+- A14B T2V uses Wan2.1 VAE latents.
+- A14B I2V adds the WanI2V ``i2v_y`` conditioning tensor.
 """
 
 from __future__ import annotations
@@ -12,15 +13,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
-import yaml
+import torchvision.transforms.functional as TF
 from decord import VideoReader, cpu
+from PIL import Image
 
 CURRENT_DIR = Path(__file__).resolve().parent
 VIDEOGPA_ROOT = CURRENT_DIR.parents[1]
@@ -34,80 +35,26 @@ for path in [TRAIN_DIR, VIDEOGPA_ROOT, WAN_PATH]:
         sys.path.insert(0, str(path))
 
 from vgm_common.config import resolve_experiment_config, write_resolved_config  # noqa: E402
+from vgm_common.paths import get_dl3dv_root  # noqa: E402
 from wan.configs import WAN_CONFIGS  # noqa: E402
 from wan.modules.t5 import T5EncoderModel  # noqa: E402
+from wan.modules.vae2_1 import Wan2_1_VAE  # noqa: E402
 from wan.modules.vae2_2 import Wan2_2_VAE  # noqa: E402
+
+FIRST_FRAME_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 
 
 def read_json(path: Path) -> Any:
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2, ensure_ascii=False)
     tmp.replace(path)
-
-
-def read_yaml(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    if not isinstance(data, dict):
-        raise ValueError(f"YAML root must be a mapping: {path}")
-    return data
-
-
-def write_yaml(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
-
-
-def resolve_path(project_root: Path, value: str | os.PathLike[str]) -> Path:
-    path = Path(value).expanduser()
-    if not path.is_absolute():
-        path = project_root / path
-    return path.resolve()
-
-
-def iter_dirs_limited(root: Path, max_depth: int = 5):
-    root = root.resolve()
-    if not root.exists():
-        return
-    for parent, dirs, _files in os.walk(root):
-        parent_path = Path(parent)
-        try:
-            depth = len(parent_path.relative_to(root).parts)
-        except ValueError:
-            continue
-        if depth > max_depth:
-            dirs[:] = []
-            continue
-        yield parent_path
-        if depth == max_depth:
-            dirs[:] = []
-
-
-def find_unique_wan_model(models_root: Path) -> Path:
-    candidates = sorted(
-        {
-            p.resolve()
-            for p in iter_dirs_limited(models_root, max_depth=5)
-            if p.is_dir()
-            and p.name == "Wan2.2-TI2V-5B"
-            and (p / "Wan2.2_VAE.pth").is_file()
-            and (p / "models_t5_umt5-xxl-enc-bf16.pth").is_file()
-            and (p / "diffusion_pytorch_model.safetensors.index.json").is_file()
-        }
-    )
-    if not candidates:
-        raise FileNotFoundError(f"No WAN2.2-TI2V-5B model found under {models_root}")
-    if len(candidates) > 1:
-        raise RuntimeError("Multiple WAN candidates found:\n" + "\n".join(str(p) for p in candidates))
-    return candidates[0]
 
 
 def resolve_config(config_path: Path | None, run_dir: Path, model_path: str | None) -> dict[str, Any]:
@@ -115,7 +62,10 @@ def resolve_config(config_path: Path | None, run_dir: Path, model_path: str | No
         raise ValueError("--config is required so paths can be resolved through the active VGM profile")
     cfg = resolve_experiment_config(config_path, run_dir, model_path_override=model_path)
     cfg.setdefault("encoding", {})
-    cfg["project"]["task"] = "t2v"
+    cfg.setdefault("model", {})
+    cfg["model"].setdefault("wan_task_key", "ti2v-5B")
+    cfg["model"].setdefault("architecture", "single_ti2v_5b")
+    cfg["model"].setdefault("vae_version", "wan2_2")
     return cfg
 
 
@@ -124,11 +74,11 @@ def safe_id(value: str) -> str:
 
 
 def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def torch_load(path: Path) -> Any:
@@ -148,16 +98,24 @@ def tensor_meta(path: Path, tensor: torch.Tensor) -> dict[str, Any]:
     }
 
 
-def condition_valid(path: Path) -> bool:
+def condition_valid(path: Path, *, task: str, architecture: str) -> bool:
     if not path.exists() or path.stat().st_size <= 0:
         return False
     data = torch_load(path)
     if not isinstance(data, dict):
         return False
-    if "image_latent" in data:
-        return False
     emb = data.get("encoder_hidden_states")
-    return isinstance(emb, torch.Tensor) and emb.numel() > 0 and torch.isfinite(emb).all().item()
+    if not isinstance(emb, torch.Tensor) or emb.numel() <= 0 or not torch.isfinite(emb).all().item():
+        return False
+    if task == "t2v":
+        return "image_latent" not in data and "i2v_y" not in data
+    if architecture == "single_ti2v_5b":
+        image_latent = data.get("image_latent")
+        return isinstance(image_latent, torch.Tensor) and image_latent.ndim == 4 and image_latent.numel() > 0
+    if architecture == "dual_expert_a14b":
+        i2v_y = data.get("i2v_y")
+        return isinstance(i2v_y, torch.Tensor) and i2v_y.ndim == 4 and i2v_y.numel() > 0
+    return False
 
 
 def latent_valid(path: Path) -> bool:
@@ -177,25 +135,169 @@ def load_video_frames(video_path: Path, num_frames: int, device: torch.device) -
     return frames.permute(3, 0, 1, 2).contiguous().to(device)
 
 
-def load_pairs(input_path: Path) -> list[dict[str, Any]]:
+def load_pairs(input_path: Path, expected_task: str) -> tuple[list[dict[str, Any]], Path]:
     payload = read_json(input_path)
     pairs = payload.get("pairs") if isinstance(payload, dict) else payload
     if not isinstance(pairs, list):
         raise ValueError(f"Expected list of preference pairs in {input_path}")
     if not pairs:
         raise ValueError(f"No preference pairs in {input_path}")
+    if isinstance(payload, dict) and payload.get("base_path"):
+        base_path = Path(payload["base_path"])
+    else:
+        base_path = input_path.parents[1] if input_path.parent.name == "manifests" else input_path.parent
     for pair in pairs:
-        if pair.get("task") != "t2v":
-            raise ValueError(f"Refusing non-T2V pair: {pair.get('pair_id')}")
+        task = str(pair.get("task", expected_task)).lower()
+        if task != expected_task:
+            raise ValueError(f"Refusing {task!r} pair in {expected_task!r} encoder: {pair.get('pair_id')}")
         if pair.get("source_split", "train") != "train":
             raise ValueError(f"Refusing non-train pair: {pair.get('pair_id')}")
-    return pairs
+    return pairs, base_path.expanduser().resolve()
+
+
+def relative_or_text(path: Path, base: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(base.resolve()))
+    except ValueError:
+        return str(path.resolve())
+
+
+def resolve_video_path(video_value: str, candidate_base_path: Path) -> Path:
+    video_path = Path(video_value).expanduser()
+    if not video_path.is_absolute():
+        video_path = candidate_base_path / video_path
+    return video_path.resolve()
+
+
+def find_first_frame(first_frames_root: Path, split: str, bucket: str, scene_id: str) -> Path | None:
+    scene_dir = first_frames_root / split / bucket.upper() / scene_id
+    for ext in FIRST_FRAME_EXTENSIONS:
+        candidate = scene_dir / f"first_frame{ext}"
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def resolve_image_path(pair: dict[str, Any], cfg: dict[str, Any], run_dir: Path) -> Path:
+    project_root = Path(cfg["project"]["project_root"])
+    data_root = get_dl3dv_root()
+    first_frames_root = Path(cfg["paths"]["first_frames_root"])
+    raw_values = [
+        pair.get("image_path"),
+        pair.get("image_prompt"),
+        pair.get("input_image_path"),
+        pair.get("first_frame_path"),
+        pair.get("first_frame_relpath"),
+    ]
+    candidates: list[Path] = []
+
+    def add_candidate(path: Path) -> None:
+        expanded = path.expanduser()
+        if expanded not in candidates:
+            candidates.append(expanded)
+
+    for value in raw_values:
+        if not value:
+            continue
+        raw = Path(str(value)).expanduser()
+        if raw.is_absolute():
+            add_candidate(raw)
+        else:
+            add_candidate(run_dir / raw)
+            add_candidate(project_root / raw)
+            add_candidate(data_root / raw)
+            add_candidate(first_frames_root / raw)
+        parts = raw.parts
+        if "first_frames" in parts:
+            idx = parts.index("first_frames")
+            tail = Path(*parts[idx + 1 :])
+            add_candidate(first_frames_root / tail)
+            add_candidate(data_root / "first_frames" / tail)
+        elif parts and parts[0] in {"train", "test"}:
+            add_candidate(first_frames_root / raw)
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+
+    scene_id = pair.get("scene_id")
+    bucket = pair.get("source_bucket")
+    split = pair.get("source_split", "train")
+    if scene_id and bucket:
+        found = find_first_frame(first_frames_root, str(split), str(bucket), str(scene_id))
+        if found is not None:
+            return found
+    tried = "\n".join(str(path) for path in candidates) or "(no explicit image path candidates)"
+    raise FileNotFoundError(f"Could not resolve first-frame image for {pair.get('pair_id', pair.get('group_id'))}:\n{tried}")
+
+
+def load_image_tensor_5b(image_path: Path, target_h: int, target_w: int, device: torch.device) -> torch.Tensor:
+    img = Image.open(image_path).convert("RGB")
+    scale = max(target_w / img.width, target_h / img.height)
+    img = img.resize((round(img.width * scale), round(img.height * scale)), Image.LANCZOS)
+    x1 = (img.width - target_w) // 2
+    y1 = (img.height - target_h) // 2
+    img = img.crop((x1, y1, x1 + target_w, y1 + target_h))
+    img_tensor = TF.to_tensor(img).sub_(0.5).div_(0.5)
+    return img_tensor.unsqueeze(1).to(device)
+
+
+def build_a14b_i2v_y(
+    image_path: Path,
+    *,
+    vae: Any,
+    latent_shape: tuple[int, int, int, int],
+    frame_num: int,
+    vae_stride: tuple[int, int, int],
+    device: torch.device,
+) -> torch.Tensor:
+    _channels, latent_f, latent_h, latent_w = latent_shape
+    target_h = latent_h * vae_stride[1]
+    target_w = latent_w * vae_stride[2]
+    img = Image.open(image_path).convert("RGB")
+    img_tensor = TF.to_tensor(img).sub_(0.5).div_(0.5).to(device)
+
+    msk = torch.ones(1, frame_num, latent_h, latent_w, device=device)
+    msk[:, 1:] = 0
+    msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
+    if msk.shape[1] < latent_f * 4:
+        pad = torch.zeros(1, latent_f * 4 - msk.shape[1], latent_h, latent_w, device=device)
+        msk = torch.cat([msk, pad], dim=1)
+    msk = msk[:, : latent_f * 4]
+    msk = msk.view(1, latent_f, 4, latent_h, latent_w).transpose(1, 2)[0]
+
+    image_video = torch.concat(
+        [
+            torch.nn.functional.interpolate(
+                img_tensor[None].cpu(),
+                size=(target_h, target_w),
+                mode="bicubic",
+                align_corners=False,
+            ).transpose(0, 1),
+            torch.zeros(3, frame_num - 1, target_h, target_w),
+        ],
+        dim=1,
+    ).to(device)
+    with torch.no_grad():
+        image_latent = vae.encode([image_video])[0]
+    return torch.concat([msk, image_latent]).detach().cpu()
+
+
+def make_vae(config: Any, vae_version: str, model_path: Path, device: torch.device) -> Any:
+    if vae_version == "wan2_1":
+        return Wan2_1_VAE(vae_pth=str(model_path / config.vae_checkpoint), device=device)
+    if vae_version == "wan2_2":
+        return Wan2_2_VAE(vae_pth=str(model_path / config.vae_checkpoint), device=device)
+    raise ValueError(f"Unsupported model.vae_version={vae_version!r}")
 
 
 def encode(args: argparse.Namespace) -> None:
     run_dir = Path(args.run_dir).expanduser().resolve()
     cfg = resolve_config(args.config if args.config else None, run_dir, args.model_path)
-    assert cfg["project"].get("task") == "t2v"
+    task = str(cfg.get("project", {}).get("task", "t2v")).lower()
+    architecture = str(cfg.get("model", {}).get("architecture", "single_ti2v_5b"))
+    wan_task_key = str(cfg.get("model", {}).get("wan_task_key", "ti2v-5B"))
+    vae_version = str(cfg.get("model", {}).get("vae_version", "wan2_2"))
     model_path = Path(cfg["paths"]["wan_model_path"]).resolve()
     input_json = Path(args.input_json or run_dir / "manifests/preference_pairs.json").expanduser().resolve()
     output_json = Path(args.output_json or run_dir / "manifests/encoded_pairs.json").expanduser().resolve()
@@ -205,7 +307,7 @@ def encode(args: argparse.Namespace) -> None:
 
     if "test_t2v" in str(input_json) or "test_i2v" in str(input_json):
         raise ValueError(f"Refusing test manifest input: {input_json}")
-    pairs = load_pairs(input_json)
+    pairs, candidate_base_path = load_pairs(input_json, task)
     if args.num_shards < 1:
         raise ValueError("--num_shards must be positive")
     if not 0 <= args.shard_index < args.num_shards:
@@ -216,7 +318,12 @@ def encode(args: argparse.Namespace) -> None:
         raise RuntimeError(f"No preference pairs assigned to shard {args.shard_index}/{args.num_shards}")
 
     print("Resolved paths:")
+    print(f"  task={task}")
+    print(f"  architecture={architecture}")
+    print(f"  wan_task_key={wan_task_key}")
+    print(f"  vae_version={vae_version}")
     print(f"  run_dir={run_dir}")
+    print(f"  candidate_base_path={candidate_base_path}")
     print(f"  model_path={model_path}")
     print(f"  input_json={input_json}")
     print(f"  output_json={output_json}")
@@ -226,7 +333,8 @@ def encode(args: argparse.Namespace) -> None:
     device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         torch.cuda.set_device(device)
-    config = WAN_CONFIGS["ti2v-5B"]
+    config = WAN_CONFIGS[wan_task_key]
+    vae_stride = tuple(int(value) for value in config.vae_stride)
     t5 = T5EncoderModel(
         text_len=config.text_len,
         dtype=config.t5_dtype,
@@ -234,7 +342,7 @@ def encode(args: argparse.Namespace) -> None:
         checkpoint_path=str(model_path / config.t5_checkpoint),
         tokenizer_path=str(model_path / config.t5_tokenizer),
     )
-    vae = Wan2_2_VAE(vae_pth=str(model_path / config.vae_checkpoint), device=device)
+    vae = make_vae(config, vae_version, model_path, device)
 
     cond_dir = encoded_root / "conditions"
     win_dir = encoded_root / "winners"
@@ -242,8 +350,8 @@ def encode(args: argparse.Namespace) -> None:
     for path in [cond_dir, win_dir, lose_dir]:
         path.mkdir(parents=True, exist_ok=True)
 
-    encoded_pairs = []
-    groups_for_dataset = []
+    encoded_pairs: list[dict[str, Any]] = []
+    groups_for_dataset: list[dict[str, Any]] = []
     for idx, pair in enumerate(pairs):
         pair_id = safe_id(pair.get("pair_id") or f"pair_{idx:06d}")
         group_id = safe_id(pair.get("group_id") or pair_id)
@@ -252,34 +360,13 @@ def encode(args: argparse.Namespace) -> None:
             raise ValueError(f"Empty prompt for {pair_id}")
         winner = dict(pair["winner"])
         loser = dict(pair["loser"])
-        for role, entry in [("winner", winner), ("loser", loser)]:
-            if any(key in entry for key in ["image_path", "image_prompt", "input_image_path"]):
-                raise ValueError(f"{role} contains image condition fields in {pair_id}")
 
-        cond_path = cond_dir / f"cond_{group_id}.pt"
-        if cond_path.exists() and condition_valid(cond_path) and not force:
-            condition = torch_load(cond_path)
-            prompt_emb = condition["encoder_hidden_states"]
-        else:
-            condition = {}
-            with torch.no_grad():
-                context = t5([prompt], device)
-            prompt_emb = context[0].detach().cpu()
-            if not torch.isfinite(prompt_emb).all().item() or prompt_emb.numel() == 0:
-                raise RuntimeError(f"Invalid prompt embedding for {pair_id}")
-            condition["encoder_hidden_states"] = prompt_emb
-            assert "image_latent" not in condition
-            torch.save(condition, cond_path)
-
-        latent_entries = {}
+        latent_entries: dict[str, dict[str, Any]] = {}
         for role, entry, out_dir in [("winner", winner, win_dir), ("loser", loser, lose_dir)]:
             video_rel = entry.get("video_path")
             if not video_rel:
                 raise ValueError(f"Missing {role} video_path for {pair_id}")
-            video_path = Path(video_rel)
-            if not video_path.is_absolute():
-                video_path = run_dir / video_path
-            video_path = video_path.resolve()
+            video_path = resolve_video_path(str(video_rel), candidate_base_path)
             if not video_path.exists():
                 raise FileNotFoundError(video_path)
             latent_path = out_dir / f"latent_{pair_id}_{role}.pt"
@@ -289,27 +376,57 @@ def encode(args: argparse.Namespace) -> None:
                 video_tensor = load_video_frames(video_path, num_frames, device)
                 with torch.no_grad():
                     latent_list = vae.encode([video_tensor])
+                if latent_list is None:
+                    raise RuntimeError(f"VAE encode returned None for {pair_id} {role}")
                 latent = latent_list[0].detach().cpu()
                 if not torch.isfinite(latent).all().item():
                     raise RuntimeError(f"Non-finite latent for {pair_id} {role}")
                 torch.save(latent, latent_path)
-            latent_entries[role] = {
-                "video_path": video_path,
-                "latent_path": latent_path,
-                "latent": latent,
-            }
+            latent_entries[role] = {"video_path": video_path, "latent_path": latent_path, "latent": latent}
 
         win_lat = latent_entries["winner"]["latent"]
         lose_lat = latent_entries["loser"]["latent"]
         if tuple(win_lat.shape) != tuple(lose_lat.shape):
             raise RuntimeError(f"Winner/loser latent shape mismatch in {pair_id}: {win_lat.shape} vs {lose_lat.shape}")
-        if win_lat.shape[1] != lose_lat.shape[1]:
-            raise RuntimeError(f"Temporal latent length mismatch in {pair_id}")
 
-        cond_loaded = torch_load(cond_path)
-        assert "image_latent" not in cond_loaded, "T2V condition must not contain image_latent"
-        assert "encoder_hidden_states" in cond_loaded
+        cond_path = cond_dir / f"cond_{group_id}.pt"
+        if cond_path.exists() and condition_valid(cond_path, task=task, architecture=architecture) and not force:
+            condition = torch_load(cond_path)
+            prompt_emb = condition["encoder_hidden_states"]
+        else:
+            condition: dict[str, Any] = {}
+            with torch.no_grad():
+                context = t5([prompt], device)
+            prompt_emb = context[0].detach().cpu()
+            if not torch.isfinite(prompt_emb).all().item() or prompt_emb.numel() == 0:
+                raise RuntimeError(f"Invalid prompt embedding for {pair_id}")
+            condition["encoder_hidden_states"] = prompt_emb
+            if task == "i2v":
+                image_path = resolve_image_path(pair, cfg, run_dir)
+                if architecture == "single_ti2v_5b":
+                    target_h = int(win_lat.shape[2]) * vae_stride[1]
+                    target_w = int(win_lat.shape[3]) * vae_stride[2]
+                    img_tensor = load_image_tensor_5b(image_path, target_h, target_w, device)
+                    with torch.no_grad():
+                        image_latent = vae.encode([img_tensor])[0].detach().cpu()
+                    condition["image_latent"] = image_latent
+                elif architecture == "dual_expert_a14b":
+                    condition["i2v_y"] = build_a14b_i2v_y(
+                        image_path,
+                        vae=vae,
+                        latent_shape=tuple(int(v) for v in win_lat.shape),
+                        frame_num=num_frames,
+                        vae_stride=vae_stride,
+                        device=device,
+                    )
+                else:
+                    raise ValueError(f"Unsupported I2V architecture: {architecture}")
+                condition["image_path"] = str(image_path)
+            torch.save(condition, cond_path)
 
+        condition_payload = torch_load(cond_path)
+        condition_keys = sorted(key for key in condition_payload.keys() if not key.endswith("_path"))
+        contains_image_condition = task == "i2v"
         winner["latent_path"] = str(latent_entries["winner"]["latent_path"].relative_to(run_dir))
         winner["condition_path"] = str(cond_path.relative_to(run_dir))
         loser["latent_path"] = str(latent_entries["loser"]["latent_path"].relative_to(run_dir))
@@ -325,35 +442,46 @@ def encode(args: argparse.Namespace) -> None:
             "condition_path": str(cond_path.relative_to(run_dir)),
             "winner_latent_path": winner["latent_path"],
             "loser_latent_path": loser["latent_path"],
-            "winner_video_path": str(latent_entries["winner"]["video_path"].relative_to(run_dir)),
-            "loser_video_path": str(latent_entries["loser"]["video_path"].relative_to(run_dir)),
+            "winner_video_path": relative_or_text(latent_entries["winner"]["video_path"], run_dir),
+            "loser_video_path": relative_or_text(latent_entries["loser"]["video_path"], run_dir),
             "winner_score": pair.get("winner_score"),
             "loser_score": pair.get("loser_score"),
             "score_gap": pair.get("score_gap"),
-            "task": "t2v",
-            "contains_image_condition": False,
+            "task": task,
+            "architecture": architecture,
+            "wan_task_key": wan_task_key,
+            "contains_image_condition": contains_image_condition,
+            "condition_keys": condition_keys,
             "text_embedding_shape": list(prompt_emb.shape),
             "video_latent_shape": list(win_lat.shape),
             "condition_meta": tensor_meta(cond_path, prompt_emb),
             "winner_latent_meta": tensor_meta(latent_entries["winner"]["latent_path"], win_lat),
             "loser_latent_meta": tensor_meta(latent_entries["loser"]["latent_path"], lose_lat),
         }
+        for key in ("image_path", "image_prompt", "first_frame_relpath", "camera_motion"):
+            if pair.get(key) is not None:
+                encoded_pair[key] = pair[key]
         encoded_pairs.append(encoded_pair)
         groups_for_dataset.append(
             {
                 "group_id": group_id,
                 "text_prompt": prompt,
-                "task": "t2v",
-                "contains_image_condition": False,
+                "task": task,
+                "architecture": architecture,
+                "contains_image_condition": contains_image_condition,
                 "videos": [winner, loser],
             }
         )
         print(f"Encoded {idx + 1}/{len(pairs)}: {pair_id}")
 
     payload = {
-        "task": "t2v",
-        "contains_image_condition": False,
+        "task": task,
+        "architecture": architecture,
+        "wan_task_key": wan_task_key,
+        "vae_version": vae_version,
+        "contains_image_condition": task == "i2v",
         "base_path": str(run_dir),
+        "candidate_base_path": str(candidate_base_path),
         "shard_index": args.shard_index,
         "num_shards": args.num_shards,
         "pairs": encoded_pairs,
@@ -365,7 +493,7 @@ def encode(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Wan2.2 T2V: encode text conditions and winner/loser video latents")
+    parser = argparse.ArgumentParser(description="Wan2.2 VideoGPA: encode text/image conditions and winner/loser video latents")
     parser.add_argument("--config", default=None)
     parser.add_argument("--run_dir", "--run-dir", dest="run_dir", required=True)
     parser.add_argument("--model_path", default=None)

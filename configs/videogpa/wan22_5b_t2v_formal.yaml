@@ -16,6 +16,9 @@ paths:
 model:
   model_relpath: wan/Wan2.2-TI2V-5B
   vggt_model_relpath: vggt/VGGT-1B
+  wan_task_key: ti2v-5B
+  architecture: single_ti2v_5b
+  vae_version: wan2_2
 
 data:
   manifest_relpath: manifests/videogpa_protocol/train_t2v.json

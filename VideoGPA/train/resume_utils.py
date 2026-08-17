@@ -85,10 +85,24 @@ def discover_checkpoint_files(checkpoint_dir: str | Path) -> dict[str, Path | No
         if path.is_file():
             adapter_model = path
             break
+    dual_adapter_models: dict[str, Path | None] = {}
+    dual_adapter_configs: dict[str, Path] = {}
+    for expert in ("low_noise_model", "high_noise_model"):
+        expert_root = root / expert
+        expert_adapter = None
+        for candidate in ("adapter_model.safetensors", "adapter_model.bin"):
+            path = expert_root / candidate
+            if path.is_file():
+                expert_adapter = path
+                break
+        dual_adapter_models[expert] = expert_adapter
+        dual_adapter_configs[expert] = expert_root / "adapter_config.json"
     return {
         "checkpoint_dir": root,
         "adapter_model": adapter_model,
         "adapter_config": root / "adapter_config.json",
+        "dual_adapter_models": dual_adapter_models,
+        "dual_adapter_configs": dual_adapter_configs,
         "optimizer": root / "optimizer.pt",
         "scheduler": root / "scheduler.pt",
         "trainer_state": root / "trainer_state.json",
@@ -104,14 +118,46 @@ def validate_checkpoint_manifest(checkpoint_dir: str | Path) -> dict[str, Path |
     if not root.is_dir():
         raise FileNotFoundError(f"Checkpoint directory does not exist: {root}")
 
+    dual_adapter_models = files.get("dual_adapter_models")
+    dual_adapter_configs = files.get("dual_adapter_configs")
+    is_dual = False
+    dual_present = False
+    if isinstance(dual_adapter_models, dict) and isinstance(dual_adapter_configs, dict):
+        dual_present = any(
+            (root / expert).exists()
+            or isinstance(dual_adapter_models.get(expert), Path)
+            or Path(dual_adapter_configs[expert]).exists()
+            for expert in ("low_noise_model", "high_noise_model")
+        )
+        is_dual = all(
+            isinstance(dual_adapter_models.get(expert), Path)
+            and Path(dual_adapter_models[expert]).is_file()
+            and Path(dual_adapter_configs[expert]).is_file()
+            for expert in ("low_noise_model", "high_noise_model")
+        )
+
     required = {
-        "adapter_model": files["adapter_model"],
-        "adapter_config": files["adapter_config"],
         "optimizer": files["optimizer"],
         "scheduler": files["scheduler"],
         "trainer_state": files["trainer_state"],
         "config_resolved": files["config_resolved"],
     }
+    if is_dual or dual_present:
+        required.update(
+            {
+                "low_noise_model.adapter_model": dual_adapter_models["low_noise_model"],
+                "low_noise_model.adapter_config": dual_adapter_configs["low_noise_model"],
+                "high_noise_model.adapter_model": dual_adapter_models["high_noise_model"],
+                "high_noise_model.adapter_config": dual_adapter_configs["high_noise_model"],
+            }
+        )
+    else:
+        required.update(
+            {
+                "adapter_model": files["adapter_model"],
+                "adapter_config": files["adapter_config"],
+            }
+        )
     missing = []
     for label, path in required.items():
         if path is None or not Path(path).is_file() or Path(path).stat().st_size <= 0:

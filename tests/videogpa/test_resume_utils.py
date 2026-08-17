@@ -42,6 +42,20 @@ def make_checkpoint(root: Path, name: str = "step_005000") -> Path:
     return checkpoint
 
 
+def make_dual_checkpoint(root: Path, name: str = "step_005000") -> Path:
+    checkpoint = root / name
+    checkpoint.mkdir(parents=True)
+    for expert in ("low_noise_model", "high_noise_model"):
+        write_file(checkpoint / expert / "adapter_model.safetensors")
+        write_file(checkpoint / expert / "adapter_config.json", "{}")
+    write_file(checkpoint / "optimizer.pt")
+    write_file(checkpoint / "scheduler.pt")
+    write_file(checkpoint / "trainer_state.json", '{"step": 5000}')
+    with (checkpoint / "config_resolved.yaml").open("w", encoding="utf-8") as handle:
+        yaml.safe_dump({"training_resolved": base_training_config()}, handle)
+    return checkpoint
+
+
 def base_training_config() -> dict[str, object]:
     return {
         "lora_rank": 64,
@@ -77,6 +91,19 @@ def test_validate_checkpoint_manifest_requires_optimizer_and_scheduler(tmp_path:
     write_file(checkpoint / "optimizer.pt")
     (checkpoint / "scheduler.pt").unlink()
     with pytest.raises(FileNotFoundError, match="scheduler"):
+        validate_checkpoint_manifest(checkpoint)
+
+
+def test_validate_checkpoint_manifest_accepts_dual_expert_adapters(tmp_path: Path) -> None:
+    checkpoint = make_dual_checkpoint(tmp_path)
+    files = validate_checkpoint_manifest(checkpoint)
+    dual_models = files["dual_adapter_models"]
+    assert isinstance(dual_models, dict)
+    assert dual_models["low_noise_model"] == checkpoint / "low_noise_model" / "adapter_model.safetensors"
+    assert dual_models["high_noise_model"] == checkpoint / "high_noise_model" / "adapter_model.safetensors"
+
+    (checkpoint / "high_noise_model" / "adapter_config.json").unlink()
+    with pytest.raises(FileNotFoundError, match="high_noise_model.adapter_config"):
         validate_checkpoint_manifest(checkpoint)
 
 

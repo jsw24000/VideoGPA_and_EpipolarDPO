@@ -237,6 +237,7 @@ class DPODataset(Dataset):
         prompt_emb = shared_condition.get("encoder_hidden_states")
         image_emb = shared_condition.get("image_embeds")      # CogVideo I2V
         image_latent = shared_condition.get("image_latent")    # Wan TI2V
+        i2v_y = shared_condition.get("i2v_y")                  # Wan A14B I2V
 
         # ========================================
         # Return dictionary
@@ -254,6 +255,8 @@ class DPODataset(Dataset):
             result["image_emb"] = image_emb
         if image_latent is not None:
             result["image_latent"] = image_latent
+        if i2v_y is not None:
+            result["i2v_y"] = i2v_y
 
         return result
 
@@ -262,7 +265,7 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     result = {}
 
     tensor_keys = ["x_win", "x_lose", "prompt_emb"]
-    optional_tensor_keys = ["image_emb", "image_latent"]
+    optional_tensor_keys = ["image_emb", "image_latent", "i2v_y"]
 
     for key in tensor_keys:
         if key in batch[0]:

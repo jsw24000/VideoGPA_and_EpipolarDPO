@@ -37,6 +37,7 @@ def finite_float(value: object) -> float | None:
 
 def pair_from_group(group: dict, cfg: dict, fallback: bool) -> tuple[dict | None, str | None]:
     scoring = cfg["scoring"]
+    task = str(group.get("task") or cfg.get("project", {}).get("task", "t2v")).lower()
     metric = scoring["metric_name"]
     mode = scoring["metric_mode"]
     min_gap = float(scoring["min_score_gap"])
@@ -89,7 +90,7 @@ def pair_from_group(group: dict, cfg: dict, fallback: bool) -> tuple[dict | None
         "scene_id": group.get("scene_id"),
         "prompt": group.get("text_prompt", group.get("prompt", "")),
         "text_prompt": group.get("text_prompt", group.get("prompt", "")),
-        "task": "t2v",
+        "task": task,
         "source_split": group.get("source_split", "train"),
         "source_bucket": group.get("source_bucket", "8k"),
         "winner": winner,
@@ -101,6 +102,9 @@ def pair_from_group(group: dict, cfg: dict, fallback: bool) -> tuple[dict | None
         "loser_motion_norm": float(loser.get("motion_norm", 0.0)),
         "debug_fallback": fallback,
     }
+    for key in ("image_path", "image_prompt", "input_image_path", "first_frame_path", "first_frame_relpath", "camera_motion"):
+        if group.get(key) is not None:
+            pair[key] = group[key]
     return pair, None
 
 
@@ -121,6 +125,7 @@ def main() -> None:
 
     run_dir = Path(args.run_dir).expanduser().resolve()
     cfg = resolve_config(Path(args.config), run_dir)
+    task = str(cfg.get("project", {}).get("task", "t2v")).lower()
     project_root = Path(cfg["project"]["project_root"])
     add_videogpa_paths(project_root)
     vggt_path = Path(cfg["paths"]["vggt_model_path"]).resolve()
@@ -135,6 +140,8 @@ def main() -> None:
     pairs_json = Path(args.pairs_json).resolve() if args.pairs_json else run_dir / "manifests/preference_pairs.json"
     data = read_json(input_json)
     groups = data.get("groups", data if isinstance(data, list) else [])
+    task = str(data.get("task") or task).lower() if isinstance(data, dict) else task
+    candidate_base_path = Path(data.get("base_path", run_dir)).expanduser().resolve() if isinstance(data, dict) else run_dir
     if args.max_prompts:
         groups = groups[: args.max_prompts]
     if args.num_shards < 1:
@@ -167,7 +174,7 @@ def main() -> None:
             entry = dict(video)
             video_path = Path(entry.get("video_path", ""))
             if not video_path.is_absolute():
-                video_path = run_dir / video_path
+                video_path = candidate_base_path / video_path
             if not video_path.exists():
                 entry["score_error"] = f"missing video: {video_path}"
                 scored_videos.append(entry)
@@ -194,8 +201,8 @@ def main() -> None:
         print(f"Scored group {idx + 1}/{len(groups)}: {group.get('group_id')}")
 
     scored_payload = {
-        "task": "t2v",
-        "base_path": str(run_dir),
+        "task": task,
+        "base_path": str(candidate_base_path),
         "metric_name": cfg["scoring"]["metric_name"],
         "metric_mode": cfg["scoring"]["metric_mode"],
         "motion_threshold": cfg["scoring"]["motion_threshold"],
@@ -229,7 +236,8 @@ def main() -> None:
             run_dir / "manifests/preference_pairs_smoke_unfiltered.json",
             {
                 "debug_only": "DEBUG_ONLY_NOT_COMPARABLE",
-                "task": "t2v",
+                "task": task,
+                "base_path": str(candidate_base_path),
                 "pairs": fallback_pairs,
             },
         )
@@ -239,7 +247,8 @@ def main() -> None:
         write_json(
             pairs_json,
             {
-                "task": "t2v",
+                "task": task,
+                "base_path": str(candidate_base_path),
                 "pairs": pairs,
                 "filtered": filtered,
                 "debug_fallback_used": fallback_used,
@@ -254,8 +263,8 @@ def main() -> None:
         raise SystemExit("Fewer than 2 preference pairs; stopping before training")
 
     pair_payload = {
-        "task": "t2v",
-        "base_path": str(run_dir),
+        "task": task,
+        "base_path": str(candidate_base_path),
         "metric_name": cfg["scoring"]["metric_name"],
         "metric_mode": cfg["scoring"]["metric_mode"],
         "motion_threshold": cfg["scoring"]["motion_threshold"],

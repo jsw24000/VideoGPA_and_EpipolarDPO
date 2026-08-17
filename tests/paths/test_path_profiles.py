@@ -51,3 +51,26 @@ def test_smoke_yaml_resolves_to_local_roots() -> None:
     assert lines[1] == str(REPO_ROOT / "data" / "manifests" / "videogpa_protocol" / "train_t2v.json")
     assert lines[2] == str(REPO_ROOT / "data" / "first_frames")
     assert lines[3] == str(REPO_ROOT / "outputs" / "videogpa" / "wan22_5b_t2v" / "smoke")
+
+
+def test_videogpa_formal_matrix_resolves_to_parallel_roots() -> None:
+    configs = {
+        "wan22_5b_t2v_formal.yaml": "wan22_5b_t2v/formal",
+        "wan22_5b_i2v_formal.yaml": "wan22_5b_i2v/formal",
+        "wan22_14b_t2v_formal.yaml": "wan22_14b_t2v/formal",
+        "wan22_14b_i2v_formal.yaml": "wan22_14b_i2v/formal",
+    }
+    for filename, suffix in configs.items():
+        proc = run_bash(
+            "source scripts/env/activate_profile.sh local >/dev/null && "
+            f"python -m vgm_common.config --config configs/videogpa/{filename} --print output_root"
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert proc.stdout.strip() == str(REPO_ROOT / "outputs" / "videogpa" / suffix)
+
+        cluster = run_bash(
+            "source scripts/env/activate_profile.sh cluster_zk >/dev/null && "
+            f"python -m vgm_common.config --config {REPO_ROOT / 'configs' / 'videogpa' / filename} --print output_root"
+        )
+        assert cluster.returncode == 0, cluster.stdout + cluster.stderr
+        assert cluster.stdout.strip().endswith(f"/outputs/VideoGPA_and_EpipolarDPO/videogpa/{suffix}")

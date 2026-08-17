@@ -10,13 +10,21 @@ ALLOW_CLUSTER_ROOT = Path("configs/paths/cluster_zk.sh")
 
 
 def tracked_files() -> list[Path]:
-    proc = subprocess.run(["git", "ls-files"], cwd=REPO_ROOT, text=True, stdout=subprocess.PIPE, check=True)
+    proc = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "--cached"],
+        cwd=REPO_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        check=True,
+    )
     files = []
     for line in proc.stdout.splitlines():
         path = Path(line)
+        if "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}:
+            continue
         if path.parts and path.parts[0] in {"configs", "scripts", "vgm_common"}:
             files.append(path)
-        if path.match("VideoGPA/generate/Wan2.2-T2V-5B.py") or path.match("VideoGPA/train/Wan2.2-T2V-5B/*.py"):
+        if path.match("VideoGPA/generate/Wan2.2-*.py") or path.match("VideoGPA/train/Wan2.2-T2V-5B/*.py"):
             files.append(path)
     return files
 
