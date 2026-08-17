@@ -11,8 +11,10 @@ METRIC_DIRECTIONS = {
     "ssim": "higher",
     "lpips": "lower",
     "mvcs": "higher",
+    "3dcs": "lower",
     "consistency_score": "lower",
     "epipolar": "lower",
+    "sampson_error": "lower",
     "motion_score": "report",
 }
 

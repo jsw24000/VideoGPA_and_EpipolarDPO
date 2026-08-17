@@ -27,6 +27,7 @@ if str(WAN_PATH) not in sys.path:
     sys.path.insert(0, str(WAN_PATH))
 
 from vgm_common.config import resolve_experiment_config, write_resolved_config  # noqa: E402
+from vgm_common.paths import get_dl3dv_root  # noqa: E402
 from wan.configs import SIZE_CONFIGS, WAN_CONFIGS  # noqa: E402
 from wan.textimage2video import WanTI2V  # noqa: E402
 
@@ -221,6 +222,24 @@ def find_first_frame(first_frames_root: Path, split: str, bucket: str, scene_id:
     return None
 
 
+def infer_source_split(scene_uid: str, bucket: str | None = None) -> str:
+    source_bucket = (bucket or scene_uid.split("/", 1)[0]).upper()
+    return "test" if source_bucket == "1K" else "train"
+
+
+def normalize_sample_defaults(item: dict[str, Any]) -> dict[str, Any]:
+    scene_uid = str(item.get("scene_uid", ""))
+    if scene_uid and "/" in scene_uid:
+        bucket, scene_id = scene_uid.split("/", 1)
+        item.setdefault("scene_id", scene_id)
+        item.setdefault("source_bucket", bucket.lower())
+        item.setdefault("source_split", infer_source_split(scene_uid, bucket))
+    elif item.get("source_bucket"):
+        item.setdefault("source_split", infer_source_split(scene_uid, str(item["source_bucket"])))
+    item.setdefault("task", "i2v")
+    return item
+
+
 def load_samples(input_json: Path) -> list[dict[str, Any]]:
     payload = read_json(input_json)
     if isinstance(payload, dict):
@@ -233,17 +252,14 @@ def load_samples(input_json: Path) -> list[dict[str, Any]]:
                 sample = dict(item)
                 sample.setdefault("scene_uid", scene_uid)
                 sample.setdefault("group_id", safe_id(scene_uid))
-                sample.setdefault("scene_id", scene_uid.split("/", 1)[-1])
-                sample.setdefault("source_split", "train")
-                sample.setdefault("source_bucket", scene_uid.split("/", 1)[0].lower())
-                sample.setdefault("task", "i2v")
-                samples.append(sample)
+                samples.append(normalize_sample_defaults(sample))
     elif isinstance(payload, list):
-        samples = payload
+        samples = [normalize_sample_defaults(dict(item)) for item in payload]
     else:
         raise ValueError(f"Unsupported prompt JSON format: {input_json}")
     clean = []
     for idx, item in enumerate(samples):
+        item = normalize_sample_defaults(dict(item))
         prompt = str(item.get("text_prompt", item.get("prompt", ""))).strip()
         if not prompt:
             raise ValueError(f"Empty prompt at sample index {idx}")
@@ -259,22 +275,42 @@ def load_samples(input_json: Path) -> list[dict[str, Any]]:
 
 def resolve_image_path(item: dict[str, Any], cfg: dict[str, Any], run_dir: Path) -> Path:
     project_root = Path(cfg["project"]["project_root"])
+    data_root = get_dl3dv_root()
     first_frames_root = Path(cfg["paths"]["first_frames_root"])
     raw_values = [
         item.get("image_path"),
         item.get("image_prompt"),
         item.get("input_image_path"),
         item.get("first_frame_path"),
+        item.get("first_frame_relpath"),
     ]
     candidates: list[Path] = []
+
+    def add_candidate(path: Path) -> None:
+        resolved = path.expanduser()
+        if resolved not in candidates:
+            candidates.append(resolved)
+
     for value in raw_values:
         if not value:
             continue
         raw = Path(str(value)).expanduser()
         if raw.is_absolute():
-            candidates.append(raw)
+            add_candidate(raw)
         else:
-            candidates.extend([run_dir / raw, project_root / raw, first_frames_root / raw])
+            add_candidate(run_dir / raw)
+            add_candidate(project_root / raw)
+            add_candidate(data_root / raw)
+            add_candidate(first_frames_root / raw)
+
+        parts = raw.parts
+        if "first_frames" in parts:
+            first_frames_idx = parts.index("first_frames")
+            tail = Path(*parts[first_frames_idx + 1 :])
+            add_candidate(first_frames_root / tail)
+            add_candidate(data_root / "first_frames" / tail)
+        elif parts and parts[0] in {"train", "test"}:
+            add_candidate(first_frames_root / raw)
     for candidate in candidates:
         if candidate.is_file():
             return candidate.resolve()
@@ -365,8 +401,8 @@ def generate(args: argparse.Namespace) -> None:
 
     if not input_json.exists():
         raise FileNotFoundError(input_json)
-    if "test_t2v" in str(input_json) or "test_i2v" in str(input_json) or "train_t2v" in str(input_json):
-        raise ValueError(f"Refusing non-I2V-train input manifest: {input_json}")
+    if "test_t2v" in str(input_json) or "train_t2v" in str(input_json):
+        raise ValueError(f"Refusing non-I2V input manifest: {input_json}")
     samples = load_samples(input_json)
     if num_prompts:
         samples = samples[:num_prompts]

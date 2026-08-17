@@ -251,6 +251,24 @@ def quarantine_invalid_video(path: Path) -> Path:
     return target
 
 
+def infer_source_split(scene_uid: str, bucket: str | None = None) -> str:
+    source_bucket = (bucket or scene_uid.split("/", 1)[0]).upper()
+    return "test" if source_bucket == "1K" else "train"
+
+
+def normalize_sample_defaults(item: dict[str, Any]) -> dict[str, Any]:
+    scene_uid = str(item.get("scene_uid", ""))
+    if scene_uid and "/" in scene_uid:
+        bucket, scene_id = scene_uid.split("/", 1)
+        item.setdefault("scene_id", scene_id)
+        item.setdefault("source_bucket", bucket.lower())
+        item.setdefault("source_split", infer_source_split(scene_uid, bucket))
+    elif item.get("source_bucket"):
+        item.setdefault("source_split", infer_source_split(scene_uid, str(item["source_bucket"])))
+    item.setdefault("task", "t2v")
+    return item
+
+
 def load_samples(input_json: Path) -> list[dict[str, Any]]:
     payload = read_json(input_json)
     if isinstance(payload, dict):
@@ -263,17 +281,14 @@ def load_samples(input_json: Path) -> list[dict[str, Any]]:
                 sample = dict(item)
                 sample.setdefault("scene_uid", scene_uid)
                 sample.setdefault("group_id", safe_id(scene_uid))
-                sample.setdefault("scene_id", scene_uid.split("/", 1)[-1])
-                sample.setdefault("source_split", "train")
-                sample.setdefault("source_bucket", scene_uid.split("/", 1)[0].lower())
-                sample.setdefault("task", "t2v")
-                samples.append(sample)
+                samples.append(normalize_sample_defaults(sample))
     elif isinstance(payload, list):
-        samples = payload
+        samples = [normalize_sample_defaults(dict(item)) for item in payload]
     else:
         raise ValueError(f"Unsupported prompt JSON format: {input_json}")
     clean = []
     for idx, item in enumerate(samples):
+        item = normalize_sample_defaults(dict(item))
         prompt = str(item.get("text_prompt", item.get("prompt", ""))).strip()
         if not prompt:
             raise ValueError(f"Empty prompt at sample index {idx}")
@@ -356,8 +371,8 @@ def generate(args: argparse.Namespace) -> None:
 
     if not input_json.exists():
         raise FileNotFoundError(input_json)
-    if "test_t2v" in str(input_json) or "test_i2v" in str(input_json) or "train_i2v" in str(input_json):
-        raise ValueError(f"Refusing non-T2V-train input manifest: {input_json}")
+    if "test_i2v" in str(input_json) or "train_i2v" in str(input_json):
+        raise ValueError(f"Refusing non-T2V input manifest: {input_json}")
     samples = load_samples(input_json)
     if num_prompts:
         samples = samples[:num_prompts]

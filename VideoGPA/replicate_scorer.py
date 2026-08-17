@@ -53,7 +53,7 @@ def build_score_config():
 
 
 SCORE_CONFIG = build_score_config()
-METRIC_COLS = ["psnr", "ssim", "lpips", "mvcs", "consistency_score", "epipolar"]
+METRIC_COLS = ["psnr", "ssim", "lpips", "mvcs", "3dcs", "epipolar", "sampson_error"]
 
 
 def build_relative_path(base_path, video_path):
@@ -114,16 +114,20 @@ def score_worker(rank, gpu_id, tasks):
                 save_visuals=False,
             )
             res = results.get(SCORE_CONFIG["conf_thres"], {})
+            consistency_score = float(res.get("Consistency_Score", 0.0))
+            epipolar_error = float(res.get("Epipolar", 0.0))
             scored_item.update(
                 {
                     "mse": float(res.get("MSE", )),
-                    "consistency_score": float(res.get("Consistency_Score", 0.0)),
+                    "3dcs": consistency_score,
+                    "consistency_score": consistency_score,
                     "motion_score": float(res.get("motion_norm", 0.0)),
                     "psnr": float(res.get("PSNR", 0.0)),
                     "ssim": float(res.get("SSIM", 0.0)),
                     "lpips": float(res.get("LPIPS", 0.0)),
                     "mvcs": float(res.get("MVCS", 0.0)),
-                    "epipolar": float(res.get("Epipolar", 0.0)),
+                    "epipolar": epipolar_error,
+                    "sampson_error": epipolar_error,
                 }
             )
         except Exception as exc:
@@ -196,6 +200,7 @@ def build_summary(df):
         if metric not in df.columns:
             df[metric] = None
 
+    summary["overall"]["error_count"] = int(df.get("error", pd.Series(dtype=object)).notna().sum())
     summary["overall"].update(
         {
             metric: (None if pd.isna(df[metric].mean()) else float(df[metric].mean()))
@@ -227,8 +232,7 @@ def save_json_report(flat_results, df):
 def main():
     all_tasks = collect_all_video_tasks()
     if not all_tasks:
-        print("No videos found for scoring.")
-        return
+        raise SystemExit("No videos found for scoring.")
 
     existing_items = load_existing_items()
     pending_tasks = [task for task in all_tasks if task["relative_path"] not in existing_items]
@@ -271,10 +275,17 @@ def main():
         key=lambda item: (item["prompt_id"], item["video_name"]),
     )
     if not flat_results:
-        print("No valid scoring results were produced.")
-        return
+        raise SystemExit("No valid scoring results were produced.")
 
     df = pd.DataFrame(flat_results)
+    for metric in METRIC_COLS:
+        if metric not in df.columns:
+            df[metric] = None
+
+    metric_values = df[METRIC_COLS].apply(pd.to_numeric, errors="coerce")
+    valid_metric_rows = int(metric_values.notna().any(axis=1).sum())
+    if valid_metric_rows == 0:
+        raise SystemExit("No videos produced valid metric values; check DA3/LightGlue setup and scorer logs.")
 
     output_csv = SCORE_CONFIG.get("output_csv")
     if output_csv:
@@ -288,14 +299,11 @@ def main():
     print("\n========================================")
     print("Overall Mean Metrics")
     print("========================================")
-    if not df.empty:
-        for metric in METRIC_COLS:
-            if metric not in df.columns:
-                df[metric] = None
-        overall_mean = df[METRIC_COLS].mean()
-        overall_mean_df = pd.DataFrame(overall_mean).T.rename(index={0: "overall"})
-        print(overall_mean_df.round(4))
-        print(f"\nTotal videos scored: {len(df)}")
+    overall_mean = metric_values.mean()
+    overall_mean_df = pd.DataFrame(overall_mean).T.rename(index={0: "overall"})
+    print(overall_mean_df.round(4))
+    print(f"\nTotal videos scored: {len(df)}")
+    print(f"Rows with at least one valid metric: {valid_metric_rows}")
 
     print("\nAll scoring tasks completed.")
 
