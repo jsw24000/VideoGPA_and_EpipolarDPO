@@ -420,36 +420,54 @@ def mount_dual_lora(engine: Any, lora_path: Path | None, lora_weight: float) -> 
     return True
 
 
+def resolve_runtime_options(
+    args: argparse.Namespace,
+    generation_cfg: dict[str, Any],
+    distributed: bool,
+) -> dict[str, bool]:
+    t5_cpu = bool(generation_cfg.get("t5_cpu", True)) if args.t5_cpu is None else bool(args.t5_cpu)
+    convert_model_dtype = (
+        bool(generation_cfg.get("convert_model_dtype", True))
+        if args.convert_model_dtype is None
+        else bool(args.convert_model_dtype)
+    )
+    t5_fsdp = bool(generation_cfg.get("t5_fsdp", False)) if args.t5_fsdp is None else bool(args.t5_fsdp)
+    dit_default = distributed
+    dit_fsdp = bool(generation_cfg.get("dit_fsdp", dit_default)) if args.dit_fsdp is None else bool(args.dit_fsdp)
+    use_sp = bool(generation_cfg.get("use_sp", False)) if args.use_sp is None else bool(args.use_sp)
+    if not distributed and (t5_fsdp or dit_fsdp or use_sp):
+        raise ValueError("FSDP/sequence parallel options require torchrun with WORLD_SIZE > 1")
+    return {
+        "t5_cpu": t5_cpu,
+        "convert_model_dtype": convert_model_dtype,
+        "t5_fsdp": t5_fsdp,
+        "dit_fsdp": dit_fsdp,
+        "use_sp": use_sp,
+    }
+
+
+def format_gib(num_bytes: int) -> str:
+    return f"{num_bytes / (1024 ** 3):.2f}GiB"
+
+
 def build_engine(
     task: str,
     wan_cfg: Any,
     model_path: Path,
     device_id: int,
     rank: int,
-    args: argparse.Namespace,
-    generation_cfg: dict[str, Any],
-    distributed: bool,
+    runtime_options: dict[str, bool],
 ) -> WanT2V | WanI2V:
-    t5_cpu = bool(generation_cfg.get("t5_cpu", True)) if args.t5_cpu is None else args.t5_cpu
-    convert_model_dtype = (
-        bool(generation_cfg.get("convert_model_dtype", True))
-        if args.convert_model_dtype is None
-        else args.convert_model_dtype
-    )
-    t5_fsdp = bool(generation_cfg.get("t5_fsdp", False)) if args.t5_fsdp is None else args.t5_fsdp
-    dit_default = distributed
-    dit_fsdp = bool(generation_cfg.get("dit_fsdp", dit_default)) if args.dit_fsdp is None else args.dit_fsdp
-    use_sp = bool(generation_cfg.get("use_sp", False)) if args.use_sp is None else args.use_sp
     common = {
         "config": wan_cfg,
         "checkpoint_dir": str(model_path),
         "device_id": device_id,
         "rank": rank,
-        "t5_fsdp": t5_fsdp,
-        "dit_fsdp": dit_fsdp,
-        "use_sp": use_sp,
-        "t5_cpu": t5_cpu,
-        "convert_model_dtype": convert_model_dtype,
+        "t5_fsdp": runtime_options["t5_fsdp"],
+        "dit_fsdp": runtime_options["dit_fsdp"],
+        "use_sp": runtime_options["use_sp"],
+        "t5_cpu": runtime_options["t5_cpu"],
+        "convert_model_dtype": runtime_options["convert_model_dtype"],
     }
     if task == "t2v":
         return WanT2V(**common)
@@ -488,6 +506,12 @@ def generate(args: argparse.Namespace) -> None:
         sample_solver = str(args.sample_solver or generation_cfg.get("sample_solver", "unipc"))
         fps = int(args.fps or generation_cfg.get("fps", 16))
         offload_model = bool(generation_cfg.get("offload_model", True)) if args.offload_model is None else args.offload_model
+        runtime_options = resolve_runtime_options(args, generation_cfg, bool(dist_state["distributed"]))
+        if runtime_options["use_sp"] and int(wan_cfg.num_heads) % int(dist_state["world_size"]) != 0:
+            raise ValueError(
+                f"Sequence parallel requires num_heads divisible by world_size: "
+                f"num_heads={wan_cfg.num_heads} world_size={dist_state['world_size']}"
+            )
 
         rank = int(dist_state["rank"])
         is_main = bool(dist_state["is_main"])
@@ -514,6 +538,11 @@ def generate(args: argparse.Namespace) -> None:
             f"  distributed={dist_state['distributed']} world_size={dist_state['world_size']} "
             f"rank={rank} device_id={device_id}"
         )
+        log(
+            f"  runtime: dit_fsdp={runtime_options['dit_fsdp']} t5_fsdp={runtime_options['t5_fsdp']} "
+            f"use_sp={runtime_options['use_sp']} offload_model={offload_model} "
+            f"t5_cpu={runtime_options['t5_cpu']} convert_model_dtype={runtime_options['convert_model_dtype']}"
+        )
 
         if not input_json.exists():
             raise FileNotFoundError(input_json)
@@ -536,7 +565,17 @@ def generate(args: argparse.Namespace) -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("WAN2.2 A14B generation requires CUDA; preflight should report GPU availability first.")
         torch.cuda.set_device(device_id)
-        engine = build_engine(task, wan_cfg, model_path, device_id, rank, args, generation_cfg, bool(dist_state["distributed"]))
+        engine = build_engine(task, wan_cfg, model_path, device_id, rank, runtime_options)
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device_id)
+        print(
+            f"[rank {rank}] CUDA after engine load: device={device_id} "
+            f"name={torch.cuda.get_device_name(device_id)} "
+            f"allocated={format_gib(torch.cuda.memory_allocated(device_id))} "
+            f"reserved={format_gib(torch.cuda.memory_reserved(device_id))} "
+            f"free={format_gib(free_bytes)} total={format_gib(total_bytes)} "
+            f"dit_fsdp={runtime_options['dit_fsdp']} t5_fsdp={runtime_options['t5_fsdp']} "
+            f"use_sp={runtime_options['use_sp']} offload_model={offload_model}"
+        )
         lora_loaded = mount_dual_lora(engine, lora_path, args.lora_weight)
         engine.low_noise_model.eval()
         engine.high_noise_model.eval()
@@ -681,6 +720,11 @@ def generate(args: argparse.Namespace) -> None:
                     "sample_solver": sample_solver,
                     "fps": fps,
                     "offload_model": offload_model,
+                    "dit_fsdp": runtime_options["dit_fsdp"],
+                    "t5_fsdp": runtime_options["t5_fsdp"],
+                    "use_sp": runtime_options["use_sp"],
+                    "t5_cpu": runtime_options["t5_cpu"],
+                    "convert_model_dtype": runtime_options["convert_model_dtype"],
                     "seeds": seeds,
                     "shard_index": args.shard_index,
                     "num_shards": args.num_shards,

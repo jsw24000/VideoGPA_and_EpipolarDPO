@@ -34,12 +34,14 @@ run_a14b() {
     if [[ "${DIT_FSDP:-1}" == "1" ]]; then
       extra_args+=(--dit_fsdp)
     fi
-    if [[ "${T5_FSDP:-0}" == "1" ]]; then
+    if [[ "${T5_FSDP:-1}" == "1" ]]; then
       extra_args+=(--t5_fsdp)
     fi
-    if [[ "${USE_SP:-0}" == "1" ]]; then
+    if [[ "${USE_SP:-1}" == "1" ]]; then
       extra_args+=(--use_sp)
     fi
+    printf '[wan22_14b_t2v] distributed A14B generation: GPU_IDS=%s DIT_FSDP=%s T5_FSDP=%s USE_SP=%s\n' \
+      "${GPU_IDS}" "${DIT_FSDP:-1}" "${T5_FSDP:-1}" "${USE_SP:-1}"
     CUDA_VISIBLE_DEVICES="${GPU_IDS}" "${PY_CMD[@]}" -m torch.distributed.run \
       --standalone \
       --nnodes=1 \

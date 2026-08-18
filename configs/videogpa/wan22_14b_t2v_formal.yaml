@@ -33,7 +33,7 @@ data:
 
 generation:
   frame_num: 81
-  size: "1280*720"
+  size: "832*480"
   sampling_steps: 40
   guide_scale: [3.0, 4.0]
   sample_shift: 12.0
@@ -82,4 +82,4 @@ training:
 formal_requirements:
   expected_train_prompts: 3147
   expected_candidate_videos: 9441
-  note: "Wan2.2 A14B uses low/high noise experts. Set GPU_IDS to the distributed worker group, e.g. 0,1,2,3."
+  note: "Wan2.2 A14B uses low/high noise experts. Default T2V generation is 832*480, 81 frames. Set GPU_IDS to the distributed worker group, e.g. 0,1,2,3."
