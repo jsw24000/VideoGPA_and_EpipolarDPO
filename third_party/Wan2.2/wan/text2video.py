@@ -5,6 +5,7 @@ import math
 import os
 import random
 import sys
+import time
 import types
 from contextlib import contextmanager
 from functools import partial
@@ -190,15 +191,57 @@ class WanT2V:
             required_model_name = 'low_noise_model'
             offload_model_name = 'high_noise_model'
         if offload_model or self.init_on_cpu:
-            if next(getattr(
-                    self,
-                    offload_model_name).parameters()).device.type == 'cuda':
-                getattr(self, offload_model_name).to('cpu')
-            if next(getattr(
-                    self,
-                    required_model_name).parameters()).device.type == 'cpu':
-                getattr(self, required_model_name).to(self.device)
+            offload_required = next(
+                getattr(self, offload_model_name).parameters()).device.type == 'cuda'
+            load_required = next(
+                getattr(self, required_model_name).parameters()).device.type == 'cpu'
+            if offload_required or load_required:
+                torch.cuda.synchronize(self.device)
+                transfer_start = time.perf_counter()
+                actions = []
+                if offload_required:
+                    getattr(self, offload_model_name).to('cpu')
+                    actions.append(f'{offload_model_name}:cuda->cpu')
+                if load_required:
+                    getattr(self, required_model_name).to(self.device)
+                    actions.append(f'{required_model_name}:cpu->cuda')
+                torch.cuda.synchronize(self.device)
+                print(
+                    f'[WanT2V transfer] rank={self.rank} '
+                    f'offload_model={offload_model} init_on_cpu={self.init_on_cpu} '
+                    f'actions={",".join(actions)} seconds={time.perf_counter() - transfer_start:.3f}',
+                    flush=True)
         return getattr(self, required_model_name)
+
+    def encode_prompt(self,
+                      input_prompt,
+                      n_prompt="",
+                      offload_model=False,
+                      context=None,
+                      context_null=None):
+        """Encode only missing prompt contexts so callers can reuse them."""
+        if context is not None and context_null is not None:
+            return context, context_null
+        if n_prompt == "":
+            n_prompt = self.sample_neg_prompt
+
+        if not self.t5_cpu:
+            self.text_encoder.model.to(self.device)
+            if context is None:
+                context = self.text_encoder([input_prompt], self.device)
+            if context_null is None:
+                context_null = self.text_encoder([n_prompt], self.device)
+            if offload_model:
+                self.text_encoder.model.cpu()
+        else:
+            cpu_device = torch.device('cpu')
+            if context is None:
+                context = self.text_encoder([input_prompt], cpu_device)
+                context = [tensor.to(self.device) for tensor in context]
+            if context_null is None:
+                context_null = self.text_encoder([n_prompt], cpu_device)
+                context_null = [tensor.to(self.device) for tensor in context_null]
+        return context, context_null
 
     def generate(self,
                  input_prompt,
@@ -210,7 +253,9 @@ class WanT2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 context=None,
+                 context_null=None):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -237,6 +282,10 @@ class WanT2V:
                 Random seed for noise generation. If -1, use random seed.
             offload_model (`bool`, *optional*, defaults to True):
                 If True, offloads models to CPU during generation to save VRAM
+            context (`list[torch.Tensor]`, *optional*):
+                Precomputed positive prompt context.
+            context_null (`list[torch.Tensor]`, *optional*):
+                Precomputed negative prompt context.
 
         Returns:
             torch.Tensor:
@@ -258,23 +307,20 @@ class WanT2V:
                             (self.patch_size[1] * self.patch_size[2]) *
                             target_shape[1] / self.sp_size) * self.sp_size
 
-        if n_prompt == "":
-            n_prompt = self.sample_neg_prompt
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
 
-        if not self.t5_cpu:
-            self.text_encoder.model.to(self.device)
-            context = self.text_encoder([input_prompt], self.device)
-            context_null = self.text_encoder([n_prompt], self.device)
-            if offload_model:
-                self.text_encoder.model.cpu()
-        else:
-            context = self.text_encoder([input_prompt], torch.device('cpu'))
-            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
-            context = [t.to(self.device) for t in context]
-            context_null = [t.to(self.device) for t in context_null]
+        torch.cuda.synchronize(self.device)
+        text_encode_start = time.perf_counter()
+        context, context_null = self.encode_prompt(
+            input_prompt=input_prompt,
+            n_prompt=n_prompt,
+            offload_model=offload_model,
+            context=context,
+            context_null=context_null)
+        torch.cuda.synchronize(self.device)
+        text_encode_seconds = time.perf_counter() - text_encode_start
 
         noise = [
             torch.randn(
@@ -332,6 +378,8 @@ class WanT2V:
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
 
+            torch.cuda.synchronize(self.device)
+            denoise_start = time.perf_counter()
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
                 timestep = [t]
@@ -359,13 +407,26 @@ class WanT2V:
                     generator=seed_g)[0]
                 latents = [temp_x0.squeeze(0)]
 
+            torch.cuda.synchronize(self.device)
+            denoise_seconds = time.perf_counter() - denoise_start
+
             x0 = latents
             if offload_model:
                 self.low_noise_model.cpu()
                 self.high_noise_model.cpu()
                 torch.cuda.empty_cache()
+            vae_decode_seconds = 0.0
             if self.rank == 0:
+                torch.cuda.synchronize(self.device)
+                vae_decode_start = time.perf_counter()
                 videos = self.vae.decode(x0)
+                torch.cuda.synchronize(self.device)
+                vae_decode_seconds = time.perf_counter() - vae_decode_start
+
+        print(
+            f'[WanT2V timing] rank={self.rank} text_encode_s={text_encode_seconds:.3f} '
+            f'denoise_s={denoise_seconds:.3f} vae_decode_s={vae_decode_seconds:.3f}',
+            flush=True)
 
         del noise, latents
         del sample_scheduler

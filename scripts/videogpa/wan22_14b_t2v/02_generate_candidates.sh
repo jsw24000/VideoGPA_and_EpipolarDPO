@@ -32,13 +32,27 @@ if [[ -n "${OFFLOAD_MODEL:-}" ]]; then
       ;;
   esac
 fi
+if [[ -n "${CACHE_TEXT_EMBEDDINGS:-}" ]]; then
+  case "${CACHE_TEXT_EMBEDDINGS}" in
+    1|true|TRUE|yes|YES)
+      RUNTIME_ARGS+=(--cache_text_embeddings)
+      ;;
+    0|false|FALSE|no|NO)
+      RUNTIME_ARGS+=(--no-cache_text_embeddings)
+      ;;
+    *)
+      printf '[wan22_14b_t2v] CACHE_TEXT_EMBEDDINGS must be 0/1 or true/false, got %s\n' "${CACHE_TEXT_EMBEDDINGS}" >&2
+      exit 2
+      ;;
+  esac
+fi
 
 PY_CMD=()
 if [[ -n "${PYTHON_BIN:-}" ]]; then
   PY_CMD=("${PYTHON_BIN}")
 else
   CONDA_ENV="${VIDEOGPA_CONDA_ENV:-wan22_videogpa}"
-  PY_CMD=(conda run -n "${CONDA_ENV}" python)
+  PY_CMD=(conda run --no-capture-output -n "${CONDA_ENV}" python)
 fi
 
 run_a14b() {
@@ -58,7 +72,7 @@ run_a14b() {
         printf '[wan22_14b_t2v] throughput shard %s/%s on physical GPU %s -> %s\n' \
           "${shard_index}" "${#GPU_LIST[@]}" "${gpu}" "${shard_manifest}"
         (
-          CUDA_VISIBLE_DEVICES="${gpu}" "${PY_CMD[@]}" "${VGM_REPO_ROOT}/VideoGPA/generate/Wan2.2-A14B.py" \
+          CUDA_VISIBLE_DEVICES="${gpu}" PYTHONUNBUFFERED=1 "${PY_CMD[@]}" "${VGM_REPO_ROOT}/VideoGPA/generate/Wan2.2-A14B.py" \
             --config "${CONFIG}" \
             --run-dir "${RUN_DIR}" \
             --input_json "${RUN_DIR}/manifests/input_subset.json" \
@@ -105,7 +119,7 @@ run_a14b() {
     fi
     printf '[wan22_14b_t2v] distributed A14B generation: GPU_IDS=%s DIT_FSDP=%s T5_FSDP=%s USE_SP=%s ULYSSES_SIZE=%s\n' \
       "${GPU_IDS}" "${DIT_FSDP:-1}" "${T5_FSDP:-1}" "${USE_SP:-1}" "${ULYSSES_SIZE:-${#GPU_LIST[@]}}"
-    CUDA_VISIBLE_DEVICES="${GPU_IDS}" "${PY_CMD[@]}" -m torch.distributed.run \
+    CUDA_VISIBLE_DEVICES="${GPU_IDS}" PYTHONUNBUFFERED=1 "${PY_CMD[@]}" -m torch.distributed.run \
       --standalone \
       --nnodes=1 \
       --nproc_per_node="${#GPU_LIST[@]}" \
@@ -121,7 +135,7 @@ run_a14b() {
       "${RUNTIME_ARGS[@]}" \
       "${FORCE_ARGS[@]}"
   else
-    "${PY_CMD[@]}" "${VGM_REPO_ROOT}/VideoGPA/generate/Wan2.2-A14B.py" \
+    PYTHONUNBUFFERED=1 "${PY_CMD[@]}" "${VGM_REPO_ROOT}/VideoGPA/generate/Wan2.2-A14B.py" \
       --config "${CONFIG}" \
       --run-dir "${RUN_DIR}" \
       --input_json "${RUN_DIR}/manifests/input_subset.json" \

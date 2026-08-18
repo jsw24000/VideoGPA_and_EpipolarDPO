@@ -40,6 +40,7 @@ generation:
   sample_solver: unipc
   fps: 16
   offload_model: false
+  cache_text_embeddings: true
   convert_model_dtype: true
   t5_cpu: false
 

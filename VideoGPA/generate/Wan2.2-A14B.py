@@ -6,6 +6,7 @@ import math
 import os
 import subprocess
 import sys
+import time
 import traceback
 from datetime import datetime
 from functools import lru_cache
@@ -32,6 +33,7 @@ from vgm_common.paths import get_dl3dv_root  # noqa: E402
 from wan.configs import MAX_AREA_CONFIGS, SIZE_CONFIGS, WAN_CONFIGS  # noqa: E402
 from wan.distributed.util import init_distributed_group  # noqa: E402
 from wan.image2video import WanI2V  # noqa: E402
+from wan.modules.attention import FLASH_ATTN_2_AVAILABLE, FLASH_ATTN_3_AVAILABLE  # noqa: E402
 from wan.text2video import WanT2V  # noqa: E402
 
 FIRST_FRAME_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
@@ -523,6 +525,14 @@ def generate(args: argparse.Namespace) -> None:
         sample_solver = str(args.sample_solver or generation_cfg.get("sample_solver", "unipc"))
         fps = int(args.fps or generation_cfg.get("fps", 16))
         offload_model = bool(generation_cfg.get("offload_model", True)) if args.offload_model is None else args.offload_model
+        cache_text_embeddings = (
+            bool(generation_cfg.get("cache_text_embeddings", True))
+            if args.cache_text_embeddings is None
+            else bool(args.cache_text_embeddings)
+        )
+        if task != "t2v":
+            cache_text_embeddings = False
+        attention_backend = "fa3" if FLASH_ATTN_3_AVAILABLE else "fa2" if FLASH_ATTN_2_AVAILABLE else "sdpa"
         runtime_options = resolve_runtime_options(
             args,
             generation_cfg,
@@ -565,7 +575,8 @@ def generate(args: argparse.Namespace) -> None:
         log(
             f"  runtime: dit_fsdp={runtime_options['dit_fsdp']} t5_fsdp={runtime_options['t5_fsdp']} "
             f"use_sp={runtime_options['use_sp']} ulysses_size={runtime_options['ulysses_size']} offload_model={offload_model} "
-            f"t5_cpu={runtime_options['t5_cpu']} convert_model_dtype={runtime_options['convert_model_dtype']}"
+            f"t5_cpu={runtime_options['t5_cpu']} convert_model_dtype={runtime_options['convert_model_dtype']} "
+            f"cache_text_embeddings={cache_text_embeddings} attention_backend={attention_backend}"
         )
 
         if not input_json.exists():
@@ -598,7 +609,8 @@ def generate(args: argparse.Namespace) -> None:
             f"reserved={format_gib(torch.cuda.memory_reserved(device_id))} "
             f"free={format_gib(free_bytes)} total={format_gib(total_bytes)} "
             f"dit_fsdp={runtime_options['dit_fsdp']} t5_fsdp={runtime_options['t5_fsdp']} "
-            f"use_sp={runtime_options['use_sp']} ulysses_size={runtime_options['ulysses_size']} offload_model={offload_model}"
+            f"use_sp={runtime_options['use_sp']} ulysses_size={runtime_options['ulysses_size']} offload_model={offload_model} "
+            f"init_on_cpu={engine.init_on_cpu} attention_backend={attention_backend}"
         )
         lora_loaded = mount_dual_lora(engine, lora_path, args.lora_weight)
         engine.low_noise_model.eval()
@@ -607,6 +619,7 @@ def generate(args: argparse.Namespace) -> None:
         if is_main:
             output_dir.mkdir(parents=True, exist_ok=True)
         groups = []
+        cached_negative_context = None
         for idx, item in enumerate(samples):
             group_id = safe_id(str(item.get("group_id", item.get("scene_uid", idx))))
             prompt = str(item.get("text_prompt", item.get("prompt", ""))).strip()
@@ -616,6 +629,7 @@ def generate(args: argparse.Namespace) -> None:
             if is_main:
                 group_dir.mkdir(parents=True, exist_ok=True)
             videos = []
+            cached_prompt_context = None
             for seed in seeds:
                 video_path = group_dir / f"seed_{seed}.mp4"
                 should_generate = True
@@ -637,10 +651,29 @@ def generate(args: argparse.Namespace) -> None:
                     should_generate = bool(flag.item())
                 try:
                     video_tensor = None
+                    timing_seconds = None
                     if should_generate:
                         with torch.inference_mode():
                             if task == "t2v":
+                                cache_prepare_seconds = 0.0
+                                if cache_text_embeddings and cached_prompt_context is None:
+                                    negative_reused = cached_negative_context is not None
+                                    torch.cuda.synchronize(device_id)
+                                    cache_prepare_start = time.perf_counter()
+                                    cached_prompt_context, cached_negative_context = engine.encode_prompt(
+                                        input_prompt=prompt,
+                                        offload_model=offload_model,
+                                        context_null=cached_negative_context,
+                                    )
+                                    torch.cuda.synchronize(device_id)
+                                    cache_prepare_seconds = time.perf_counter() - cache_prepare_start
+                                    print(
+                                        f"[rank {rank}] T5 cache prepared group={group_id} "
+                                        f"seconds={cache_prepare_seconds:.3f} negative_reused={negative_reused}",
+                                        flush=True,
+                                    )
                                 print(f"[rank {rank}] T2V A14B generating group={group_id} seed={seed}")
+                                generate_start = time.perf_counter()
                                 video_tensor = engine.generate(
                                     input_prompt=prompt,
                                     size=size,
@@ -651,12 +684,16 @@ def generate(args: argparse.Namespace) -> None:
                                     guide_scale=guide_scale,
                                     seed=seed,
                                     offload_model=offload_model,
+                                    context=cached_prompt_context,
+                                    context_null=cached_negative_context,
                                 )
+                                generate_seconds = time.perf_counter() - generate_start
                             else:
                                 assert image_path is not None
                                 print(f"[rank {rank}] I2V A14B generating group={group_id} seed={seed} image={image_path}")
                                 with Image.open(image_path) as raw_image:
                                     image = raw_image.convert("RGB")
+                                generate_start = time.perf_counter()
                                 video_tensor = engine.generate(
                                     input_prompt=prompt,
                                     img=image,
@@ -669,10 +706,28 @@ def generate(args: argparse.Namespace) -> None:
                                     seed=seed,
                                     offload_model=offload_model,
                                 )
+                                generate_seconds = time.perf_counter() - generate_start
                     if is_main and should_generate:
                         if video_tensor is None:
                             raise RuntimeError("Rank 0 did not receive generated frames")
+                        save_start = time.perf_counter()
                         save_video_ffmpeg(video_tensor, video_path, fps=fps, force=args.force)
+                        save_seconds = time.perf_counter() - save_start
+                        timing_seconds = {
+                            "t5_cache_prepare": cache_prepare_seconds if task == "t2v" else 0.0,
+                            "generate_including_vae": generate_seconds,
+                            "mp4_save": save_seconds,
+                            "total": (cache_prepare_seconds if task == "t2v" else 0.0)
+                            + generate_seconds
+                            + save_seconds,
+                        }
+                        print(
+                            f"[timing] group={group_id} seed={seed} "
+                            f"t5_cache_prepare_s={timing_seconds['t5_cache_prepare']:.3f} "
+                            f"generate_including_vae_s={generate_seconds:.3f} "
+                            f"mp4_save_s={save_seconds:.3f} total_s={timing_seconds['total']:.3f}",
+                            flush=True,
+                        )
                 except Exception:
                     traceback.print_exc()
                     raise
@@ -697,6 +752,8 @@ def generate(args: argparse.Namespace) -> None:
                     }
                     if video_record["max_area"] is None:
                         del video_record["max_area"]
+                    if timing_seconds is not None:
+                        video_record["timing_seconds"] = timing_seconds
                     videos.append(video_record)
             if is_main:
                 group = {
@@ -744,6 +801,8 @@ def generate(args: argparse.Namespace) -> None:
                     "sample_solver": sample_solver,
                     "fps": fps,
                     "offload_model": offload_model,
+                    "cache_text_embeddings": cache_text_embeddings,
+                    "attention_backend": attention_backend,
                     "dit_fsdp": runtime_options["dit_fsdp"],
                     "t5_fsdp": runtime_options["t5_fsdp"],
                     "use_sp": runtime_options["use_sp"],
@@ -793,6 +852,7 @@ def main() -> None:
     parser.add_argument("--sample_solver", type=str, default=None)
     parser.add_argument("--fps", type=int, default=None)
     parser.add_argument("--offload_model", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--cache_text_embeddings", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--t5_cpu", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--convert_model_dtype", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--t5_fsdp", action=argparse.BooleanOptionalAction, default=None)
