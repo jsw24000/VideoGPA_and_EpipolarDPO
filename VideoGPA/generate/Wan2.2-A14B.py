@@ -30,6 +30,7 @@ if str(WAN_PATH) not in sys.path:
 from vgm_common.config import resolve_experiment_config, write_resolved_config  # noqa: E402
 from vgm_common.paths import get_dl3dv_root  # noqa: E402
 from wan.configs import MAX_AREA_CONFIGS, SIZE_CONFIGS, WAN_CONFIGS  # noqa: E402
+from wan.distributed.util import init_distributed_group  # noqa: E402
 from wan.image2video import WanI2V  # noqa: E402
 from wan.text2video import WanT2V  # noqa: E402
 
@@ -424,6 +425,7 @@ def resolve_runtime_options(
     args: argparse.Namespace,
     generation_cfg: dict[str, Any],
     distributed: bool,
+    world_size: int,
 ) -> dict[str, bool]:
     t5_cpu = bool(generation_cfg.get("t5_cpu", True)) if args.t5_cpu is None else bool(args.t5_cpu)
     convert_model_dtype = (
@@ -434,15 +436,30 @@ def resolve_runtime_options(
     t5_fsdp = bool(generation_cfg.get("t5_fsdp", False)) if args.t5_fsdp is None else bool(args.t5_fsdp)
     dit_default = distributed
     dit_fsdp = bool(generation_cfg.get("dit_fsdp", dit_default)) if args.dit_fsdp is None else bool(args.dit_fsdp)
-    use_sp = bool(generation_cfg.get("use_sp", False)) if args.use_sp is None else bool(args.use_sp)
+    if args.ulysses_size is not None:
+        ulysses_size = int(args.ulysses_size)
+    elif args.use_sp is not None:
+        ulysses_size = world_size if bool(args.use_sp) else 1
+    elif "ulysses_size" in generation_cfg:
+        ulysses_size = int(generation_cfg["ulysses_size"])
+    elif bool(generation_cfg.get("use_sp", False)):
+        ulysses_size = world_size
+    else:
+        ulysses_size = 1
+    if ulysses_size < 1:
+        raise ValueError(f"ulysses_size must be positive, got {ulysses_size}")
+    use_sp = ulysses_size > 1
     if not distributed and (t5_fsdp or dit_fsdp or use_sp):
         raise ValueError("FSDP/sequence parallel options require torchrun with WORLD_SIZE > 1")
+    if use_sp and ulysses_size != world_size:
+        raise ValueError(f"ulysses_size must equal WORLD_SIZE for Wan sequence parallel: ulysses_size={ulysses_size} WORLD_SIZE={world_size}")
     return {
         "t5_cpu": t5_cpu,
         "convert_model_dtype": convert_model_dtype,
         "t5_fsdp": t5_fsdp,
         "dit_fsdp": dit_fsdp,
         "use_sp": use_sp,
+        "ulysses_size": ulysses_size,
     }
 
 
@@ -506,12 +523,19 @@ def generate(args: argparse.Namespace) -> None:
         sample_solver = str(args.sample_solver or generation_cfg.get("sample_solver", "unipc"))
         fps = int(args.fps or generation_cfg.get("fps", 16))
         offload_model = bool(generation_cfg.get("offload_model", True)) if args.offload_model is None else args.offload_model
-        runtime_options = resolve_runtime_options(args, generation_cfg, bool(dist_state["distributed"]))
+        runtime_options = resolve_runtime_options(
+            args,
+            generation_cfg,
+            bool(dist_state["distributed"]),
+            int(dist_state["world_size"]),
+        )
         if runtime_options["use_sp"] and int(wan_cfg.num_heads) % int(dist_state["world_size"]) != 0:
             raise ValueError(
                 f"Sequence parallel requires num_heads divisible by world_size: "
                 f"num_heads={wan_cfg.num_heads} world_size={dist_state['world_size']}"
             )
+        if runtime_options["use_sp"]:
+            init_distributed_group()
 
         rank = int(dist_state["rank"])
         is_main = bool(dist_state["is_main"])
@@ -540,7 +564,7 @@ def generate(args: argparse.Namespace) -> None:
         )
         log(
             f"  runtime: dit_fsdp={runtime_options['dit_fsdp']} t5_fsdp={runtime_options['t5_fsdp']} "
-            f"use_sp={runtime_options['use_sp']} offload_model={offload_model} "
+            f"use_sp={runtime_options['use_sp']} ulysses_size={runtime_options['ulysses_size']} offload_model={offload_model} "
             f"t5_cpu={runtime_options['t5_cpu']} convert_model_dtype={runtime_options['convert_model_dtype']}"
         )
 
@@ -574,7 +598,7 @@ def generate(args: argparse.Namespace) -> None:
             f"reserved={format_gib(torch.cuda.memory_reserved(device_id))} "
             f"free={format_gib(free_bytes)} total={format_gib(total_bytes)} "
             f"dit_fsdp={runtime_options['dit_fsdp']} t5_fsdp={runtime_options['t5_fsdp']} "
-            f"use_sp={runtime_options['use_sp']} offload_model={offload_model}"
+            f"use_sp={runtime_options['use_sp']} ulysses_size={runtime_options['ulysses_size']} offload_model={offload_model}"
         )
         lora_loaded = mount_dual_lora(engine, lora_path, args.lora_weight)
         engine.low_noise_model.eval()
@@ -723,6 +747,7 @@ def generate(args: argparse.Namespace) -> None:
                     "dit_fsdp": runtime_options["dit_fsdp"],
                     "t5_fsdp": runtime_options["t5_fsdp"],
                     "use_sp": runtime_options["use_sp"],
+                    "ulysses_size": runtime_options["ulysses_size"],
                     "t5_cpu": runtime_options["t5_cpu"],
                     "convert_model_dtype": runtime_options["convert_model_dtype"],
                     "seeds": seeds,
@@ -773,6 +798,7 @@ def main() -> None:
     parser.add_argument("--t5_fsdp", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--dit_fsdp", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--use_sp", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--ulysses_size", type=int, default=None)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     if args.seed is not None and args.candidate_seeds is None:

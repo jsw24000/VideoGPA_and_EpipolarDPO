@@ -441,10 +441,10 @@ generate_variant() {
         extra_args+=(--t5_fsdp)
       fi
       if [[ "${USE_SP:-1}" == "1" ]]; then
-        extra_args+=(--use_sp)
+        extra_args+=(--ulysses_size "${ULYSSES_SIZE:-${#gpu_list[@]}}")
       fi
-      printf '[run_eval] distributed A14B generation for %s: GPU_IDS=%s DIT_FSDP=%s T5_FSDP=%s USE_SP=%s\n' \
-        "${variant}" "${GPU_IDS}" "${DIT_FSDP:-1}" "${T5_FSDP:-1}" "${USE_SP:-1}"
+      printf '[run_eval] distributed A14B generation for %s: GPU_IDS=%s DIT_FSDP=%s T5_FSDP=%s USE_SP=%s ULYSSES_SIZE=%s\n' \
+        "${variant}" "${GPU_IDS}" "${DIT_FSDP:-1}" "${T5_FSDP:-1}" "${USE_SP:-1}" "${ULYSSES_SIZE:-${#gpu_list[@]}}"
       CUDA_VISIBLE_DEVICES="${GPU_IDS}" "${PY_CMD[@]}" -m torch.distributed.run \
         --standalone \
         --nnodes=1 \

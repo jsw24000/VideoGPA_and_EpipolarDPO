@@ -24,7 +24,19 @@ def test_14b_t2v_multigpu_defaults_enable_fsdp_and_sequence_parallel() -> None:
     assert "${USE_SP:-1}" in launcher
     assert "--dit_fsdp" in launcher
     assert "--t5_fsdp" in launcher
-    assert "--use_sp" in launcher
+    assert "--ulysses_size" in launcher
+    assert "ULYSSES_SIZE:-${#GPU_LIST[@]}" in launcher
+
+
+def test_14b_t2v_throughput_mode_runs_one_shard_per_gpu() -> None:
+    launcher = (REPO_ROOT / "scripts/videogpa/wan22_14b_t2v/02_generate_candidates.sh").read_text(encoding="utf-8")
+
+    assert "A14B_PARALLEL_MODE" in launcher
+    assert "candidate_groups.shard_${shard_index}.json" in launcher
+    assert "generation.shard_${shard_index}.log" in launcher
+    assert "--shard_index" in launcher
+    assert "--num_shards" in launcher
+    assert "merge_shards.py\" groups" in launcher
 
 
 def test_a14b_eval_multigpu_defaults_enable_sequence_parallel() -> None:
@@ -32,3 +44,4 @@ def test_a14b_eval_multigpu_defaults_enable_sequence_parallel() -> None:
 
     assert "${T5_FSDP:-1}" in launcher
     assert "${USE_SP:-1}" in launcher
+    assert "--ulysses_size" in launcher
