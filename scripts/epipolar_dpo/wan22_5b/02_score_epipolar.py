@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import sys
 from pathlib import Path
 from typing import Any
+import types
 
 from common import (
     finite_float,
@@ -30,10 +32,46 @@ def add_upstream_metric_path(project_root: Path) -> None:
         sys.path.insert(0, text)
 
 
+def _ensure_package_stub(name: str, path: Path) -> None:
+    module = sys.modules.get(name)
+    if module is None:
+        module = types.ModuleType(name)
+        module.__package__ = name
+        module.__path__ = [str(path)]  # type: ignore[attr-defined]
+        sys.modules[name] = module
+        return
+    paths = list(getattr(module, "__path__", []))
+    if str(path) not in paths:
+        paths.insert(0, str(path))
+        module.__path__ = paths  # type: ignore[attr-defined]
+
+
+def _load_metric_module(module_name: str, module_path: Path):
+    cached = sys.modules.get(module_name)
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load {module_name} from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def build_evaluators(project_root: Path, cfg: dict[str, Any]):
     add_upstream_metric_path(project_root)
-    from metrics.video_evaluation.dynamics import DynamicsEvaluator
-    from metrics.video_evaluation.epipolar import EpipolarEvaluator
+
+    metrics_root = project_root / "Epipolar-DPO" / "metrics"
+    video_eval_root = metrics_root / "video_evaluation"
+    _ensure_package_stub("metrics", metrics_root)
+    _ensure_package_stub("metrics.video_evaluation", video_eval_root)
+    _load_metric_module("metrics.video_evaluation.base", video_eval_root / "base.py")
+    dynamics_module = _load_metric_module("metrics.video_evaluation.dynamics", video_eval_root / "dynamics.py")
+    epipolar_module = _load_metric_module("metrics.video_evaluation.epipolar", video_eval_root / "epipolar.py")
+
+    DynamicsEvaluator = dynamics_module.DynamicsEvaluator
+    EpipolarEvaluator = epipolar_module.EpipolarEvaluator
 
     scoring = cfg.get("scoring", {})
     epipolar_cfg = scoring.get("epipolar", {})
@@ -71,6 +109,8 @@ def score_one_video(video: dict[str, Any], source_run: Path, epipolar: Any, moti
         entry["epipolar_valid"] = True
 
     try:
+        if hasattr(motion, "first_frame"):
+            motion.first_frame = None
         motion_score, motion_details = motion.evaluate_video(str(video_path))
     except Exception as exc:
         motion_score, motion_details = -1.0, {"error": f"{type(exc).__name__}: {exc}"}
@@ -94,6 +134,7 @@ def main() -> None:
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--max-groups", type=int, default=None)
+    parser.add_argument("--check-runtime-imports", action="store_true")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
@@ -107,6 +148,14 @@ def main() -> None:
 
     if args.gpu_id is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
+
+    if args.check_runtime_imports:
+        epipolar, motion = build_evaluators(project_root, cfg)
+        print(
+            "Epipolar scoring runtime imports OK: "
+            f"epipolar={epipolar.__class__.__name__}, motion={motion.__class__.__name__}"
+        )
+        return
 
     source_payload = read_json(input_json)
     groups = shard_groups(load_groups(source_payload), args.shard_index, args.num_shards, args.max_groups)

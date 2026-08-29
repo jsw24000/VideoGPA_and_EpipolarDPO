@@ -17,6 +17,14 @@ def run_text(cmd: list[str], cwd: Path) -> str:
         return f"ERROR: {type(exc).__name__}: {exc}"
 
 
+def run_required(cmd: list[str], cwd: Path, label: str) -> str:
+    try:
+        return subprocess.check_output(cmd, cwd=cwd, text=True, stderr=subprocess.STDOUT).strip()
+    except subprocess.CalledProcessError as exc:
+        output = exc.output.strip()
+        raise RuntimeError(f"{label} failed with exit code {exc.returncode}\n{output}") from exc
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Preflight for WAN2.2 5B Epipolar-DPO sibling pipeline")
     parser.add_argument("--config", required=True)
@@ -45,6 +53,7 @@ def main() -> None:
             "Epipolar-DPO/metrics/video_evaluation/epipolar.py",
             "Epipolar-DPO/metrics/video_evaluation/dynamics.py",
             "Epipolar-DPO/model_training/reward_lora/loss.py",
+            "scripts/epipolar_dpo/wan22_5b/02_score_epipolar.py",
         ]
         if not (project_root / rel).is_file()
     ]
@@ -56,6 +65,20 @@ def main() -> None:
         raise FileNotFoundError(f"Configured source candidate manifest does not exist: {source_manifest}")
     if shutil.which("ffprobe") is None:
         raise FileNotFoundError("ffprobe is required for the upstream candidate provenance check")
+
+    scoring_runtime_import_check = run_required(
+        [
+            sys.executable,
+            str(project_root / "scripts/epipolar_dpo/wan22_5b/02_score_epipolar.py"),
+            "--config",
+            str(Path(args.config).expanduser().resolve()),
+            "--run-dir",
+            str(run_dir),
+            "--check-runtime-imports",
+        ],
+        project_root,
+        "Epipolar scoring runtime import check",
+    )
 
     report = {
         "status": "PASS",
@@ -75,6 +98,7 @@ def main() -> None:
         "metric_name": cfg.get("scoring", {}).get("metric_name"),
         "metric_mode": cfg.get("scoring", {}).get("metric_mode"),
         "motion_metric_name": cfg.get("motion_filter", {}).get("metric_name", "motion_dynamics"),
+        "scoring_runtime_import_check": scoring_runtime_import_check,
         "git_commit": run_text(["git", "rev-parse", "HEAD"], project_root),
         "git_status_short": run_text(["git", "status", "--short"], project_root),
         "python": sys.executable,
@@ -97,6 +121,7 @@ def main() -> None:
                 f"- metric_mode: `{report['metric_mode']}`",
                 f"- latent_provenance: `{report['latent_provenance']}`",
                 f"- condition_schema: `{report['condition_schema']}`",
+                f"- scoring_runtime_import_check: `{report['scoring_runtime_import_check']}`",
                 "",
             ]
         ),

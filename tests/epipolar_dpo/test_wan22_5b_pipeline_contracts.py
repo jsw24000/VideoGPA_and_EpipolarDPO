@@ -16,6 +16,7 @@ from vgm_common.config import PathConfigError, resolve_experiment_config  # noqa
 
 COMMON_PATH = REPO_ROOT / "scripts" / "epipolar_dpo" / "wan22_5b" / "common.py"
 MERGE_PATH = REPO_ROOT / "scripts" / "epipolar_dpo" / "wan22_5b" / "merge_shards.py"
+SCORE_PATH = REPO_ROOT / "scripts" / "epipolar_dpo" / "wan22_5b" / "02_score_epipolar.py"
 LOSS_PATH = REPO_ROOT / "VideoGPA" / "train" / "loss.py"
 
 
@@ -372,6 +373,40 @@ def test_scored_shard_merge_is_deterministic(tmp_path: Path) -> None:
     merged = merger.merge_scored_payloads([shard0, shard1], order_payload)
     assert [group["group_id"] for group in merged["groups"]] == ["g0", "g1", "g2"]
     assert merged["score_summary"] == {"groups": 3, "candidates": 0, "scored_now": 3, "reused": 1, "invalid_or_failed": 1}
+
+
+def test_scoring_loader_avoids_optional_upstream_video_evaluation_imports(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    for name in list(sys.modules):
+        if name == "metrics" or name.startswith("metrics."):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+
+    score_mod = load_module("epipolar_score_loader_test", SCORE_PATH)
+    video_eval = tmp_path / "Epipolar-DPO" / "metrics" / "video_evaluation"
+    video_eval.mkdir(parents=True)
+    (video_eval / "__init__.py").write_text("raise RuntimeError('video_evaluation init should not run')\n", encoding="utf-8")
+    (video_eval / "base.py").write_text("class BaseEvaluator:\n    pass\n", encoding="utf-8")
+    (video_eval / "dynamics.py").write_text(
+        "from metrics.video_evaluation.base import BaseEvaluator\n"
+        "class DynamicsEvaluator(BaseEvaluator):\n"
+        "    @classmethod\n"
+        "    def from_config(cls, config):\n"
+        "        return cls()\n",
+        encoding="utf-8",
+    )
+    (video_eval / "epipolar.py").write_text(
+        "from metrics.video_evaluation.base import BaseEvaluator\n"
+        "class EpipolarEvaluator(BaseEvaluator):\n"
+        "    @classmethod\n"
+        "    def from_config(cls, config):\n"
+        "        return cls()\n",
+        encoding="utf-8",
+    )
+
+    epipolar, motion = score_mod.build_evaluators(tmp_path, {"scoring": {"epipolar": {}, "motion": {}}})
+
+    assert epipolar.__class__.__name__ == "EpipolarEvaluator"
+    assert motion.__class__.__name__ == "DynamicsEvaluator"
+    assert "metrics.video_evaluation.shadow" not in sys.modules
 
 
 def test_epipolar_dpo_loss_matches_upstream_formula() -> None:
