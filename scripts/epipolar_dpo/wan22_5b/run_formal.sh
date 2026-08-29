@@ -97,6 +97,7 @@ write_record "${RUN_DIR}/environment.txt" bash -c '
   printf "PYTHONPATH=%s\n" "${PYTHONPATH:-}"
   printf "EPIPOLAR_DPO_MAX_GROUPS=%s\n" "${EPIPOLAR_DPO_MAX_GROUPS:-}"
   printf "EPIPOLAR_DPO_MAX_TRAIN_STEPS=%s\n" "${EPIPOLAR_DPO_MAX_TRAIN_STEPS:-}"
+  printf "EPIPOLAR_DPO_TRAIN_WARMUP_STEPS=%s\n" "${EPIPOLAR_DPO_TRAIN_WARMUP_STEPS:-}"
 '
 write_record "${RUN_DIR}/git_state.txt" bash -c '
   git -C "${VGM_REPO_ROOT}" rev-parse HEAD 2>/dev/null || true
@@ -172,12 +173,15 @@ if [[ -n "${EPIPOLAR_DPO_MAX_GROUPS:-}" ]]; then
   MAX_GROUP_ARGS+=(--max-groups "${EPIPOLAR_DPO_MAX_GROUPS}")
 fi
 
-printf '#!/usr/bin/env bash\nset -euo pipefail\nsource %q %q\nunset CUDA_VISIBLE_DEVICES\nVIDEOGPA_CONDA_ENV=%q GPU_ID=%q GPU_IDS=%q bash %q --config %q --run-id %q --resume\n' \
+printf '#!/usr/bin/env bash\nset -euo pipefail\nsource %q %q\nunset CUDA_VISIBLE_DEVICES\nVIDEOGPA_CONDA_ENV=%q GPU_ID=%q GPU_IDS=%q EPIPOLAR_DPO_MAX_GROUPS=%q EPIPOLAR_DPO_MAX_TRAIN_STEPS=%q EPIPOLAR_DPO_TRAIN_WARMUP_STEPS=%q bash %q --config %q --run-id %q --resume\n' \
   "${VGM_REPO_ROOT}/scripts/env/activate_profile.sh" \
   "${VGM_PROFILE}" \
   "${VIDEOGPA_CONDA_ENV:-wan22_videogpa}" \
   "${GPU_ID}" \
   "${GPU_IDS}" \
+  "${EPIPOLAR_DPO_MAX_GROUPS:-}" \
+  "${EPIPOLAR_DPO_MAX_TRAIN_STEPS:-}" \
+  "${EPIPOLAR_DPO_TRAIN_WARMUP_STEPS:-}" \
   "${SCRIPT_DIR}/run_formal.sh" \
   "${CONFIG}" \
   "${RUN_ID}" > "${RUN_DIR}/reproduce.sh"

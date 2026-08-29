@@ -36,6 +36,9 @@ done
 if [[ -n "${EPIPOLAR_DPO_MAX_TRAIN_STEPS:-}" ]]; then
   TRAIN_ARGS+=(--max_train_steps "${EPIPOLAR_DPO_MAX_TRAIN_STEPS}")
 fi
+if [[ -n "${EPIPOLAR_DPO_TRAIN_WARMUP_STEPS:-}" ]]; then
+  TRAIN_ARGS+=(--warmup_steps "${EPIPOLAR_DPO_TRAIN_WARMUP_STEPS}")
+fi
 
 PY_CMD=()
 if [[ -n "${PYTHON_BIN:-}" ]]; then

@@ -246,6 +246,8 @@ def resolve_config(args: argparse.Namespace) -> dict[str, Any]:
     )
     if args.max_train_steps:
         train_cfg["max_steps"] = args.max_train_steps
+    if args.warmup_steps is not None:
+        train_cfg["warmup_steps"] = args.warmup_steps
     if args.device is not None:
         train_cfg["device"] = args.device
     cfg["training_resolved"] = train_cfg
@@ -280,8 +282,16 @@ def init_distributed() -> dict[str, int | bool]:
     if distributed:
         import torch.distributed as dist
 
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
         if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
+            if torch.cuda.is_available():
+                try:
+                    dist.init_process_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"))
+                except TypeError:
+                    dist.init_process_group(backend="nccl")
+            else:
+                dist.init_process_group(backend="nccl")
     return {
         "distributed": distributed,
         "world_size": world_size,
@@ -305,6 +315,12 @@ def distributed_barrier(state: dict[str, int | bool]) -> None:
         return
     import torch.distributed as dist
 
+    if torch.cuda.is_available():
+        try:
+            dist.barrier(device_ids=[int(state["local_rank"])])
+            return
+        except TypeError:
+            pass
     dist.barrier()
 
 
@@ -1132,6 +1148,7 @@ def train(args: argparse.Namespace) -> None:
 
         while step < int(cfg["max_steps"]):
             step_start = time.time()
+            optimizer_lr_before_step = float(optimizer.param_groups[0]["lr"])
             optimizer.zero_grad(set_to_none=True)
             debug: dict[str, Any] = {}
             step_loss = 0.0
@@ -1175,6 +1192,7 @@ def train(args: argparse.Namespace) -> None:
                 "loser_reference_error": debug["loser_reference_error"],
                 "implicit_reward_margin": reward_margin,
                 "grad_norm": grad_value,
+                "optimizer_lr_before_step": optimizer_lr_before_step,
                 "learning_rate": float(scheduler.get_last_lr()[0]),
                 "gpu_allocated_gb": allocated,
                 "gpu_reserved_gb": reserved,
@@ -1218,20 +1236,50 @@ def train(args: argparse.Namespace) -> None:
             grad_nonzero = bool(flag.item())
 
         final_ckpt = checkpoint_root / f"step_{step:06d}"
+        policy_model = unwrap_model(transformer)
+        lora_delta = trainable_delta(lora_before, policy_model)
+        base_changed = frozen_param_changed(policy_model, frozen_before)
+        ref_changed = frozen_param_changed(ref_transformer, ref_before)
+        lora_changed = lora_delta > 0
+        adapter_layout_ok = True
+        adapter_layout_error = ""
         if is_main:
-            policy_model = unwrap_model(transformer)
-            lora_delta = trainable_delta(lora_before, policy_model)
-            base_changed = frozen_param_changed(policy_model, frozen_before)
-            ref_changed = frozen_param_changed(ref_transformer, ref_before)
-            if lora_delta <= 0:
-                raise RuntimeError("LoRA parameters did not change")
-            if not grad_nonzero:
-                raise RuntimeError("No non-zero gradient observed")
-            if base_changed:
-                raise RuntimeError("A sampled frozen base parameter changed")
-            if ref_changed:
-                raise RuntimeError("A sampled reference parameter changed")
-            assert_checkpoint_adapter_layout(final_ckpt, cfg)
+            try:
+                assert_checkpoint_adapter_layout(final_ckpt, cfg)
+            except Exception as exc:
+                adapter_layout_ok = False
+                adapter_layout_error = f"{type(exc).__name__}: {exc}"
+
+        if dist_state["distributed"]:
+            import torch.distributed as dist
+
+            lora_changed_flag = torch.tensor([1 if lora_changed else 0], device=device, dtype=torch.int32)
+            base_changed_flag = torch.tensor([1 if base_changed else 0], device=device, dtype=torch.int32)
+            ref_changed_flag = torch.tensor([1 if ref_changed else 0], device=device, dtype=torch.int32)
+            adapter_layout_flag = torch.tensor([1 if adapter_layout_ok else 0], device=device, dtype=torch.int32)
+            dist.all_reduce(lora_changed_flag, op=dist.ReduceOp.MIN)
+            dist.all_reduce(base_changed_flag, op=dist.ReduceOp.MAX)
+            dist.all_reduce(ref_changed_flag, op=dist.ReduceOp.MAX)
+            dist.broadcast(adapter_layout_flag, src=0)
+            lora_changed = bool(lora_changed_flag.item())
+            base_changed = bool(base_changed_flag.item())
+            ref_changed = bool(ref_changed_flag.item())
+            adapter_layout_ok = bool(adapter_layout_flag.item())
+
+        validation_errors = []
+        if not lora_changed:
+            validation_errors.append("LoRA parameters did not change")
+        if not grad_nonzero:
+            validation_errors.append("No non-zero gradient observed")
+        if base_changed:
+            validation_errors.append("A sampled frozen base parameter changed")
+        if ref_changed:
+            validation_errors.append("A sampled reference parameter changed")
+        if not adapter_layout_ok:
+            suffix = f": {adapter_layout_error}" if adapter_layout_error and is_main else ""
+            validation_errors.append(f"Checkpoint adapter layout validation failed{suffix}")
+        if validation_errors:
+            raise RuntimeError("; ".join(validation_errors))
 
         distributed_barrier(dist_state)
         del ref_transformer
@@ -1282,6 +1330,7 @@ def main() -> None:
     parser.add_argument("--metadata_path", default=None)
     parser.add_argument("--output_dir", default=None)
     parser.add_argument("--max_train_steps", type=int, default=None)
+    parser.add_argument("--warmup_steps", "--warmup-steps", type=int, default=None)
     parser.add_argument("--device", type=int, default=None)
     parser.add_argument("--resume", action="store_true", help="Resume from the latest complete checkpoint under output_dir/checkpoints")
     parser.add_argument("--resume_from_checkpoint", "--resume-from-checkpoint", default=None)
