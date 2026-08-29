@@ -68,8 +68,10 @@ DEFAULT_CONFIG = {
     "min_gap": 0.05,
     "metric_threshold": 0.8,
     "motion_threshold": 0.001,
+    "motion_metric_name": "motion_norm",
     "learning_rate": 5e-6,
     "beta": 1.0,
+    "loss_strategy": "dpo",
     "max_steps": 5,
     "warmup_steps": 500,
     "batch_size": 1,
@@ -193,12 +195,20 @@ def resolve_config(args: argparse.Namespace) -> dict[str, Any]:
             "min_gap": cfg.get("scoring", {}).get("min_score_gap", train_cfg["min_gap"]),
             "metric_threshold": cfg.get("scoring", {}).get("winner_score_threshold", train_cfg["metric_threshold"]),
             "motion_threshold": cfg.get("scoring", {}).get("motion_threshold", train_cfg["motion_threshold"]),
+            "motion_metric_name": cfg.get("motion_filter", {}).get(
+                "metric_name",
+                cfg.get("scoring", {}).get("motion_metric_name", train_cfg["motion_metric_name"]),
+            ),
         }
     )
     train_cfg.update(
         {
             "learning_rate": yaml_train.get("learning_rate", train_cfg["learning_rate"]),
             "beta": yaml_train.get("dpo_beta", yaml_train.get("beta", train_cfg["beta"])),
+            "loss_strategy": yaml_train.get(
+                "loss_strategy",
+                yaml_train.get("train_strategy", train_cfg["loss_strategy"]),
+            ),
             "max_steps": yaml_train.get("max_train_steps", yaml_train.get("max_steps", train_cfg["max_steps"])),
             "warmup_steps": yaml_train.get("warmup_steps", train_cfg["warmup_steps"]),
             "batch_size": yaml_train.get("batch_size_per_gpu", yaml_train.get("batch_size", train_cfg["batch_size"])),
@@ -515,6 +525,7 @@ def build_dataloader(run_dir: Path, metadata_path: Path, cfg: dict[str, Any], di
         min_gap=0.0,
         metric_threshold=None,
         motion_threshold=0.0,
+        motion_metric_name=cfg.get("motion_metric_name", "motion_norm"),
     )
     if len(dataset) < 2:
         raise RuntimeError(f"Need at least 2 preference pairs for DPO smoke, got {len(dataset)}")
@@ -802,6 +813,12 @@ def shared_step(
         v_win_target,
         v_lose_target,
     )
+    loss_metrics: dict[str, float] = {}
+    for key, value in (loss_out.metrics or {}).items():
+        if isinstance(value, torch.Tensor):
+            loss_metrics[key] = float(value.detach().cpu().item())
+        else:
+            loss_metrics[key] = float(value)
     with torch.no_grad():
         win_policy_err = (v_win_pred.float() - v_win_target).pow(2).mean().item()
         lose_policy_err = (v_lose_pred.float() - v_lose_target).pow(2).mean().item()
@@ -819,6 +836,8 @@ def shared_step(
         "seq_len": seq_len,
         "task": task,
         "architecture": architecture,
+        "loss_strategy": cfg.get("loss_strategy", "dpo"),
+        "loss_metrics": loss_metrics,
     }
     if image_latent_shape is not None:
         debug["image_latent_shape"] = image_latent_shape
@@ -967,10 +986,14 @@ def train(args: argparse.Namespace) -> None:
         log(f"  dual_expert={is_dual_expert(cfg)}")
         log(f"  distributed={dist_state['distributed']}")
         log(f"  world_size={dist_state['world_size']}")
+        log(f"  batch_size_per_gpu={cfg['batch_size']}")
+        log(f"  gradient_accumulation_steps={cfg['accumulate_grad_batches']}")
+        log(f"  loss_strategy={cfg['loss_strategy']}")
         log(f"  dpo_beta={cfg['beta']}")
         log(f"  learning_rate={cfg['learning_rate']}")
         log(f"  max_steps={cfg['max_steps']}")
         effective_batch = int(cfg["batch_size"]) * int(cfg["accumulate_grad_batches"]) * int(dist_state["world_size"])
+        log(f"  effective_global_pair_batch={effective_batch}")
         log(f"  effective_global_batch_size={effective_batch}")
         if resume_checkpoint is not None:
             log(f"  resume_checkpoint={resume_checkpoint}")
@@ -1053,7 +1076,7 @@ def train(args: argparse.Namespace) -> None:
             raise RuntimeError("Reference model unexpectedly contains LoRA parameters")
         transformer.train()
 
-        loss_fn = create_loss_strategy(strategy="dpo", beta=float(cfg["beta"]))
+        loss_fn = create_loss_strategy(strategy=str(cfg["loss_strategy"]), beta=float(cfg["beta"]))
         optimizer = torch.optim.AdamW((p for p in transformer.parameters() if p.requires_grad), lr=float(cfg["learning_rate"]))
         scheduler = get_cosine_schedule_with_warmup(
             optimizer,
@@ -1145,6 +1168,7 @@ def train(args: argparse.Namespace) -> None:
                 "world_size": int(dist_state["world_size"]),
                 "total_loss": step_loss,
                 "dpo_loss": step_loss,
+                "loss_strategy": cfg["loss_strategy"],
                 "winner_policy_error": debug["winner_policy_error"],
                 "loser_policy_error": debug["loser_policy_error"],
                 "winner_reference_error": debug["winner_reference_error"],
@@ -1157,6 +1181,7 @@ def train(args: argparse.Namespace) -> None:
                 "step_time_sec": time.time() - step_start,
                 "debug_shapes": debug,
             }
+            row.update(debug.get("loss_metrics", {}))
             if is_main:
                 metrics.append(row)
                 print(json.dumps(row, ensure_ascii=False))
@@ -1178,6 +1203,7 @@ def train(args: argparse.Namespace) -> None:
                         "metrics": metrics,
                         "trainable_stats": stats,
                         "distributed": dist_state,
+                        "effective_global_pair_batch": effective_batch,
                         "effective_global_batch_size": effective_batch,
                     },
                     cfg_all,
@@ -1227,6 +1253,8 @@ def train(args: argparse.Namespace) -> None:
                 "image_conditioned_branch": cfg["task"] == "i2v",
                 "dual_expert": is_dual_expert(cfg),
                 "distributed": dist_state,
+                "loss_strategy": cfg["loss_strategy"],
+                "effective_global_pair_batch": effective_batch,
                 "effective_global_batch_size": effective_batch,
                 "steps": step,
                 "checkpoint_path": str(final_ckpt),
@@ -1247,7 +1275,7 @@ def train(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Wan2.2 T2V VideoGPA DPO LoRA smoke trainer")
+    parser = argparse.ArgumentParser(description="Wan2.2 VideoGPA/Epipolar-DPO LoRA trainer")
     parser.add_argument("--config", default=None)
     parser.add_argument("--run_dir", "--run-dir", dest="run_dir", required=True)
     parser.add_argument("--model_path", default=None)

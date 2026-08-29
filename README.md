@@ -36,3 +36,4 @@ Useful docs:
 - [Cluster ZK Profile](docs/cluster_zk_profile.md)
 - [Data Pipeline](docs/data_pipeline.md)
 - [Gitignored Runtime Data](docs/gitignored_runtime_data.md)
+- [WAN2.2 5B Epipolar-DPO Pipeline](docs/epipolar_dpo_wan22_5b_pipeline.md)

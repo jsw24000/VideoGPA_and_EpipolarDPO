@@ -80,6 +80,17 @@ def _legacy_output_subdir(value: str | None, fallback: str) -> str:
     return path.as_posix()
 
 
+def _require_relative_config_path(value: object, label: str) -> str:
+    if value is None or str(value).strip() == "":
+        raise PathConfigError(f"Missing required relative {label}")
+    path = Path(str(value)).expanduser()
+    if path.is_absolute():
+        raise PathConfigError(f"Committed config {label} must be relative: {value}")
+    if ".." in path.parts:
+        raise PathConfigError(f"Committed config {label} must not escape its root: {value}")
+    return path.as_posix()
+
+
 def _resolve_model_value(value: str | None, kind: str) -> Path:
     if not value or value == "auto":
         return find_unique_model_dir(kind)
@@ -146,6 +157,23 @@ def resolve_experiment_config(
     first_frames_root = resolve_data_path(data_cfg["first_frames_relroot"])
     output_root = resolve_output_path(output_subdir)
 
+    source_cfg = cfg.get("source")
+    resolved_source_paths: dict[str, str] = {}
+    if isinstance(source_cfg, dict) and source_cfg.get("run_relpath") is not None:
+        source_run_relpath = _require_relative_config_path(source_cfg.get("run_relpath"), "source.run_relpath")
+        source_manifest_relpath = _require_relative_config_path(
+            source_cfg.get("candidate_manifest_relpath", "manifests/candidate_groups.json"),
+            "source.candidate_manifest_relpath",
+        )
+        source_cfg["run_relpath"] = source_run_relpath
+        source_cfg["candidate_manifest_relpath"] = source_manifest_relpath
+        source_run = resolve_output_path(source_run_relpath)
+        source_candidate_manifest = (source_run / source_manifest_relpath).resolve(strict=False)
+        resolved_source_paths = {
+            "source_run": str(source_run),
+            "source_candidate_manifest": str(source_candidate_manifest),
+        }
+
     cfg["paths"].update(
         {
             "config_path": str(path),
@@ -160,6 +188,7 @@ def resolve_experiment_config(
             "profile_output_root": str(get_output_root()),
         }
     )
+    cfg["paths"].update(resolved_source_paths)
     if run_dir is not None:
         run_path = Path(run_dir).expanduser()
         cfg["paths"]["run_dir"] = str(run_path.resolve(strict=False) if run_path.is_absolute() else resolve_output_path(run_path))
@@ -176,7 +205,19 @@ def main() -> int:
     parser.add_argument("--config", required=True)
     parser.add_argument("--run-dir", default=None)
     parser.add_argument("--profile", default=None)
-    parser.add_argument("--print", choices=["json", "output_root", "model_path", "manifest_path", "first_frames_root"], default="json")
+    parser.add_argument(
+        "--print",
+        choices=[
+            "json",
+            "output_root",
+            "model_path",
+            "manifest_path",
+            "first_frames_root",
+            "source_run",
+            "source_candidate_manifest",
+        ],
+        default="json",
+    )
     args = parser.parse_args()
 
     if args.profile:
@@ -194,6 +235,10 @@ def main() -> int:
         print(cfg["paths"]["train_manifest"])
     elif args.print == "first_frames_root":
         print(cfg["paths"]["first_frames_root"])
+    elif args.print == "source_run":
+        print(cfg["paths"]["source_run"])
+    elif args.print == "source_candidate_manifest":
+        print(cfg["paths"]["source_candidate_manifest"])
     return 0
 
 

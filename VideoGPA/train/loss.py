@@ -20,6 +20,7 @@ class LossOutput:
     winner_reward: torch.Tensor             # Implicit reward for the winner
     loser_reward: torch.Tensor              # Implicit reward for the loser
     accuracy: torch.Tensor                  # Preference accuracy (ratio where winner reward > loser reward)
+    metrics: Optional[Dict[str, torch.Tensor]] = None
 
 
 class DPOLoss(nn.Module):
@@ -118,6 +119,69 @@ class DPOLoss(nn.Module):
             winner_reward=winner_reward.mean(),
             loser_reward=loser_reward.mean(),
             accuracy=accuracy,
+            metrics={
+                "dpo_logits": logits.mean(),
+                "dpo_beta": torch.as_tensor(self.beta, device=logits.device, dtype=logits.dtype),
+            },
+        )
+
+
+class EpipolarDPOLoss(nn.Module):
+    """
+    Flow-DPO objective used by the upstream Epipolar-DPO reward LoRA trainer.
+
+    The existing VideoGPA ``dpo`` strategy keeps its historical beta scaling.
+    This strategy preserves the upstream 0.5 factor and exposes the Epipolar
+    error terms in metrics so run metadata can audit the exact objective.
+    """
+
+    def __init__(self, beta: float = 500.0):
+        super().__init__()
+        self.beta = float(beta)
+
+    def forward(
+        self,
+        v_win: torch.Tensor,
+        v_lose: torch.Tensor,
+        v_win_ref: torch.Tensor,
+        v_lose_ref: torch.Tensor,
+        v_win_target: torch.Tensor,
+        v_lose_target: torch.Tensor,
+    ) -> LossOutput:
+        model_win_err = (v_win - v_win_target).pow(2).mean(dim=[1, 2, 3, 4])
+        model_lose_err = (v_lose - v_lose_target).pow(2).mean(dim=[1, 2, 3, 4])
+        ref_win_err = (v_win_ref - v_win_target).pow(2).mean(dim=[1, 2, 3, 4])
+        ref_lose_err = (v_lose_ref - v_lose_target).pow(2).mean(dim=[1, 2, 3, 4])
+
+        win_diff = model_win_err - ref_win_err
+        lose_diff = model_lose_err - ref_lose_err
+        inside_term = -0.5 * self.beta * (win_diff - lose_diff)
+        dpo_loss = -F.logsigmoid(inside_term).mean()
+
+        winner_reward = -win_diff
+        loser_reward = -lose_diff
+        reward_margin = winner_reward - loser_reward
+        accuracy = (reward_margin > 0).float().mean()
+        metric_dtype = inside_term.dtype
+        metric_device = inside_term.device
+        return LossOutput(
+            loss=dpo_loss,
+            reward_margin=reward_margin.mean(),
+            winner_reward=winner_reward.mean(),
+            loser_reward=loser_reward.mean(),
+            accuracy=accuracy,
+            metrics={
+                "model_win_err": model_win_err.mean(),
+                "model_lose_err": model_lose_err.mean(),
+                "ref_win_err": ref_win_err.mean(),
+                "ref_lose_err": ref_lose_err.mean(),
+                "win_diff": win_diff.mean(),
+                "lose_diff": lose_diff.mean(),
+                "inside_term": inside_term.mean(),
+                "beta": torch.as_tensor(self.beta, device=metric_device, dtype=metric_dtype),
+                "half_factor": torch.as_tensor(0.5, device=metric_device, dtype=metric_dtype),
+                "sign": torch.as_tensor(-1.0, device=metric_device, dtype=metric_dtype),
+            },
         )
 
 
@@ -138,6 +202,8 @@ def create_loss_strategy(
     """
     if strategy == "dpo":
         return DPOLoss(beta=beta, label_smoothing=label_smoothing)
+    elif strategy == "epipolar_dpo":
+        return EpipolarDPOLoss(beta=beta)
     elif strategy == "sft":
         # SFT uses simple MSE loss
         class SFTLoss(nn.Module):
@@ -149,6 +215,7 @@ def create_loss_strategy(
                     winner_reward=torch.tensor(0.0),
                     loser_reward=torch.tensor(0.0),
                     accuracy=torch.tensor(0.0),
+                    metrics={},
                 )
         return SFTLoss()
     else:

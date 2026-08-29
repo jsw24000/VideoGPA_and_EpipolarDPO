@@ -303,6 +303,7 @@ def encode(args: argparse.Namespace) -> None:
     output_json = Path(args.output_json or run_dir / "manifests/encoded_pairs.json").expanduser().resolve()
     encoded_root = Path(args.encoded_root or run_dir / "encoded").expanduser().resolve()
     num_frames = int(args.num_frames or cfg.get("encoding", {}).get("num_frames", cfg.get("generation", {}).get("frame_num", 81)))
+    latent_provenance = str(cfg.get("encoding", {}).get("latent_provenance", "posthoc_mp4_vae"))
     force = bool(args.force)
 
     if "test_t2v" in str(input_json) or "test_i2v" in str(input_json):
@@ -447,6 +448,9 @@ def encode(args: argparse.Namespace) -> None:
             "winner_score": pair.get("winner_score"),
             "loser_score": pair.get("loser_score"),
             "score_gap": pair.get("score_gap"),
+            "metric_name": pair.get("metric_name", cfg.get("scoring", {}).get("metric_name")),
+            "metric_mode": pair.get("metric_mode", cfg.get("scoring", {}).get("metric_mode")),
+            "latent_provenance": pair.get("latent_provenance", latent_provenance),
             "task": task,
             "architecture": architecture,
             "wan_task_key": wan_task_key,
@@ -469,19 +473,26 @@ def encode(args: argparse.Namespace) -> None:
                 "task": task,
                 "architecture": architecture,
                 "contains_image_condition": contains_image_condition,
+                "latent_provenance": pair.get("latent_provenance", latent_provenance),
                 "videos": [winner, loser],
             }
         )
         print(f"Encoded {idx + 1}/{len(pairs)}: {pair_id}")
 
     payload = {
+        "method": cfg.get("project", {}).get("method", "videogpa"),
         "task": task,
         "architecture": architecture,
         "wan_task_key": wan_task_key,
         "vae_version": vae_version,
         "contains_image_condition": task == "i2v",
+        "latent_provenance": latent_provenance,
+        "condition_schema": ["encoder_hidden_states"] if task == "t2v" else condition_keys,
         "base_path": str(run_dir),
         "candidate_base_path": str(candidate_base_path),
+        "source_run_relpath": cfg.get("source", {}).get("run_relpath"),
+        "source_candidate_manifest": cfg.get("paths", {}).get("source_candidate_manifest"),
+        "source_candidate_manifest_relpath": cfg.get("source", {}).get("candidate_manifest_relpath"),
         "shard_index": args.shard_index,
         "num_shards": args.num_shards,
         "pairs": encoded_pairs,

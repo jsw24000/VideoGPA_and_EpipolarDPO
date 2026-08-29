@@ -59,6 +59,7 @@ class DPODataset(Dataset):
         min_gap: float = 0.1,                  # Minimum gap between Winner and Loser
         metric_threshold: Optional[float] = None,  # Threshold for the Winner
         motion_threshold: float = 0.001,         # Minimum motion magnitude
+        motion_metric_name: Optional[str] = "motion_norm",
         max_samples: Optional[int] = None,
     ):
         """
@@ -69,6 +70,7 @@ class DPODataset(Dataset):
             min_gap: Minimum gap/margin between Winner and Loser.
             metric_threshold: Threshold that the Winner must meet.
             motion_threshold: Minimum motion magnitude (used to filter out static videos).
+            motion_metric_name: Motion metric field, e.g. "motion_norm" or "motion_dynamics".
             max_samples: Maximum number of samples to process (for debugging).
         """
         super().__init__()
@@ -80,6 +82,7 @@ class DPODataset(Dataset):
         self.min_gap = min_gap
         self.metric_threshold = metric_threshold
         self.motion_threshold = motion_threshold
+        self.motion_metric_name = motion_metric_name
 
         print(f"Loading metadata from {metadata_path}...")
         with open(metadata_path, 'r') as f:
@@ -128,8 +131,9 @@ class DPODataset(Dataset):
             valid_videos = []
 
             for video in videos:
-                if (self.metric_name not in video or
-                    'motion_norm' not in video):
+                if self.metric_name not in video:
+                    continue
+                if self.motion_metric_name is not None and self.motion_metric_name not in video:
                     continue
 
                 if ('latent_path' not in video or
@@ -144,8 +148,13 @@ class DPODataset(Dataset):
                 if not full_cond_path.exists():
                     continue
 
-                if video['motion_norm'] < self.motion_threshold:
-                    continue
+                if self.motion_metric_name is not None:
+                    try:
+                        motion_value = float(video[self.motion_metric_name])
+                    except Exception:
+                        continue
+                    if not np.isfinite(motion_value) or motion_value < self.motion_threshold:
+                        continue
 
                 valid_videos.append(video)
 
