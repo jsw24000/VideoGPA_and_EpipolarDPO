@@ -98,6 +98,24 @@ def parse_seed_list(text: str | None, cfg: dict[str, Any]) -> list[int]:
     return [int(seed) for seed in seeds]
 
 
+def sample_seed_list(item: dict[str, Any], default_seeds: list[int], use_sample_seeds: bool) -> list[int]:
+    if not use_sample_seeds:
+        return list(default_seeds)
+    raw_seeds = item.get("seeds")
+    if raw_seeds is not None:
+        if isinstance(raw_seeds, list):
+            seeds = [int(seed) for seed in raw_seeds]
+        else:
+            seeds = [int(seed.strip()) for seed in str(raw_seeds).split(",") if seed.strip()]
+    elif item.get("seed") is not None:
+        seeds = [int(item["seed"])]
+    else:
+        raise ValueError(f"--use_sample_seeds requires each sample to contain seed or seeds: {item.get('group_id')}")
+    if not seeds:
+        raise ValueError(f"Empty sample seeds for {item.get('group_id')}")
+    return seeds
+
+
 def parse_size(size: str) -> tuple[int, int]:
     if size not in SIZE_CONFIGS:
         if "*" not in size:
@@ -564,9 +582,10 @@ def generate(args: argparse.Namespace) -> None:
         log(f"  output_manifest={output_manifest}")
         log(f"  lora_path={lora_path}")
         log("Generation args:")
+        seed_text = "per-sample" if args.use_sample_seeds else str(seeds)
         log(
             f"  task={task} wan_task_key={wan_task_key} size={size_text} max_area={max_area} "
-            f"frame_num={frame_num} steps={sampling_steps} shift={shift} guide_scale={guide_scale_json(guide_scale)} seeds={seeds}"
+            f"frame_num={frame_num} steps={sampling_steps} shift={shift} guide_scale={guide_scale_json(guide_scale)} seeds={seed_text}"
         )
         log(
             f"  distributed={dist_state['distributed']} world_size={dist_state['world_size']} "
@@ -630,7 +649,10 @@ def generate(args: argparse.Namespace) -> None:
                 group_dir.mkdir(parents=True, exist_ok=True)
             videos = []
             cached_prompt_context = None
-            for seed in seeds:
+            item_seeds = sample_seed_list(item, seeds, args.use_sample_seeds)
+            if args.candidates_per_prompt:
+                item_seeds = item_seeds[: args.candidates_per_prompt]
+            for seed in item_seeds:
                 video_path = group_dir / f"seed_{seed}.mp4"
                 should_generate = True
                 if is_main:
@@ -810,6 +832,7 @@ def generate(args: argparse.Namespace) -> None:
                     "t5_cpu": runtime_options["t5_cpu"],
                     "convert_model_dtype": runtime_options["convert_model_dtype"],
                     "seeds": seeds,
+                    "use_sample_seeds": bool(args.use_sample_seeds),
                     "shard_index": args.shard_index,
                     "num_shards": args.num_shards,
                     "distributed": dist_state,
@@ -839,6 +862,7 @@ def main() -> None:
     parser.add_argument("--gpu_id", type=int, default=0)
     parser.add_argument("--candidate_seeds", type=str, default=None)
     parser.add_argument("--candidates_per_prompt", type=int, default=None)
+    parser.add_argument("--use_sample_seeds", "--use-sample-seeds", action="store_true")
     parser.add_argument("--seed", type=int, default=None, help="Compatibility alias for one candidate seed")
     parser.add_argument("--num_prompts", type=int, default=None)
     parser.add_argument("--shard_index", type=int, default=0)

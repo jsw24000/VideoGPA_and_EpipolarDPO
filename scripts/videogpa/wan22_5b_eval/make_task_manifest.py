@@ -10,13 +10,18 @@ from make_eval_manifest import assert_no_absolute_paths, read_json, write_json
 
 COMMON_SAMPLE_KEYS = [
     "index",
+    "prompt_id",
     "scene_uid",
     "scene_id",
     "group_id",
+    "source_group_id",
     "source_split",
     "source_bucket",
     "text_prompt",
     "seed",
+    "seed_source",
+    "stratum",
+    "scripted_camera_motion",
     "caption_source",
     "caption_source_file",
     "caption_source_key",

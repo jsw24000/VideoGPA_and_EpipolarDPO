@@ -131,6 +131,143 @@ def test_eval_100_subset_is_seeded_and_reproducible(tmp_path: Path) -> None:
     assert len(first_scene_ids) == len(set(first_scene_ids)) == 100
 
 
+def test_fixed_500_eval_subset_has_stable_prompt_ids_and_per_prompt_seeds(tmp_path: Path) -> None:
+    out = tmp_path / "wan22_dl3dv1k_fixed500_seed456.json"
+    command = (
+        "source scripts/env/activate_profile.sh local >/dev/null && "
+        "python scripts/videogpa/wan22_5b_eval/make_fixed_eval_subset.py "
+        f"--output {out} --limit 500 --sampling-seed 456 --per-prompt-seed-base 100000"
+    )
+    proc = run_bash(command)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["protocol"] == "wan22_dl3dv1k_fixed_subset_eval_v1"
+    assert payload["num_samples"] == 500
+    assert payload["selection"]["strategy"] == "stratified_proportional_without_replacement"
+    assert payload["selection"]["requested_limit"] == 500
+    assert payload["selection"]["source_size"] == 1000
+    assert payload["generation_settings"]["seed_policy"] == "per_prompt_seed"
+
+    samples = payload["samples"]
+    indices = [sample["index"] for sample in samples]
+    assert len(indices) == len(set(indices)) == 500
+    assert indices == sorted(indices)
+    assert indices != list(range(500))
+    assert all(sample["group_id"] == sample["prompt_id"] for sample in samples)
+    assert all(sample["prompt_id"] == f"prompt_{sample['index']:06d}" for sample in samples)
+    assert all(sample["seed"] == 100000 + sample["index"] for sample in samples)
+    assert all("source_group_id" in sample for sample in samples)
+    assert all("stratum" in sample for sample in samples)
+    assert not [text for text in iter_strings(payload) if text.startswith("/")]
+
+
+def test_task_manifest_preserves_fixed_prompt_seed_metadata(tmp_path: Path) -> None:
+    canonical = tmp_path / "fixed.json"
+    i2v_out = tmp_path / "i2v_fixed.json"
+    command = (
+        "source scripts/env/activate_profile.sh local >/dev/null && "
+        "python scripts/videogpa/wan22_5b_eval/make_fixed_eval_subset.py "
+        f"--output {canonical} --limit 12 --sampling-seed 456 && "
+        f"python scripts/videogpa/wan22_5b_eval/make_task_manifest.py --input {canonical} --output {i2v_out} --task i2v"
+    )
+    proc = run_bash(command)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    payload = json.loads(i2v_out.read_text(encoding="utf-8"))
+    sample = payload["samples"][0]
+    assert payload["task"] == "i2v"
+    assert sample["group_id"] == sample["prompt_id"]
+    assert sample["seed"] == 100000 + sample["index"]
+    assert sample["seed_source"] == "per_prompt_seed_base_plus_source_index"
+    assert "stratum" in sample
+
+
+def test_eval_runner_manifest_only_accepts_fixed_eval_manifest(tmp_path: Path) -> None:
+    run_dir = tmp_path / "eval_compare_i2v"
+    run_dir.mkdir()
+    (run_dir / "config_resolved.yaml").write_text(
+        "project:\n  method: videogpa\n  model_scale: 5b\n  task: i2v\n",
+        encoding="utf-8",
+    )
+    fixed_manifest = tmp_path / "fixed_manifest.json"
+    fixed_manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "protocol": "wan22_dl3dv1k_fixed_subset_eval_v1",
+                "tasks": ["t2v", "i2v"],
+                "split": "test",
+                "source_subset": "1K",
+                "prompt": "CogVLM2 natural caption",
+                "i2v_extra_input": "same-scene first frame",
+                "seed": 456,
+                "seeds": [100017, 100042],
+                "num_samples": 2,
+                "selection": {"strategy": "test_fixed"},
+                "generation_settings": {
+                    "frame_num": 81,
+                    "size": "1280*704",
+                    "sampling_steps": 50,
+                    "sample_shift": 5.0,
+                    "guide_scale": 5.0,
+                    "sample_solver": "unipc",
+                    "fps": 24,
+                    "seed_policy": "per_prompt_seed",
+                },
+                "path_policy": {"contains_absolute_paths": False},
+                "samples": [
+                    {
+                        "index": 17,
+                        "prompt_id": "prompt_000017",
+                        "scene_uid": "1K/scene17",
+                        "scene_id": "scene17",
+                        "group_id": "prompt_000017",
+                        "source_group_id": "1K__scene17",
+                        "source_split": "test",
+                        "source_bucket": "1K",
+                        "text_prompt": "A fixed prompt.",
+                        "seed": 100017,
+                        "first_frame_relpath": "first_frames/test/1K/scene17/first_frame.png",
+                    },
+                    {
+                        "index": 42,
+                        "prompt_id": "prompt_000042",
+                        "scene_uid": "1K/scene42",
+                        "scene_id": "scene42",
+                        "group_id": "prompt_000042",
+                        "source_group_id": "1K__scene42",
+                        "source_split": "test",
+                        "source_bucket": "1K",
+                        "text_prompt": "Another fixed prompt.",
+                        "seed": 100042,
+                        "first_frame_relpath": "first_frames/test/1K/scene42/first_frame.png",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    command = (
+        "source scripts/env/activate_profile.sh local >/dev/null && "
+        f"PYTHON_BIN=python bash scripts/videogpa/wan22_5b_eval/run_eval.sh --run-dir {run_dir} "
+        "--task i2v --eval-name fixed500_seed456 --eval-manifest "
+        f"{fixed_manifest} --per-sample-seeds --manifest-only"
+    )
+    proc = run_bash(command)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    eval_dir = run_dir / "evaluation" / "fixed500_seed456"
+    canonical = json.loads((eval_dir / "manifests/eval_1k_seed456.json").read_text(encoding="utf-8"))
+    task_manifest = json.loads((eval_dir / "manifests/task_eval_1k_seed456.json").read_text(encoding="utf-8"))
+    environment = (eval_dir / "config/environment.txt").read_text(encoding="utf-8")
+    assert canonical["num_samples"] == task_manifest["num_samples"] == 2
+    assert task_manifest["samples"][0]["group_id"] == "prompt_000017"
+    assert task_manifest["samples"][0]["seed"] == 100017
+    assert "PER_SAMPLE_SEEDS=1" in environment
+    assert f"EVAL_MANIFEST={fixed_manifest}" in environment
+
+
 def test_eval_runner_manifest_only_uses_flat_100_sample_layout(tmp_path: Path) -> None:
     run_dir = tmp_path / "wan22_5b_t2v_formal_001"
     run_dir.mkdir()
@@ -157,6 +294,9 @@ def test_eval_runner_manifest_only_uses_flat_100_sample_layout(tmp_path: Path) -
     assert 'local out_dir="${SCORE_DIR}/da3"' in runner
     assert 'local base_dir="${GEN_DIR}/${task}/${variant}"' not in runner
     assert 'assert_variant_video_count "${variant}" "${out_dir}"' in runner
+    assert "--eval-manifest" in runner
+    assert "--per-sample-seeds" in runner
+    assert "--use_sample_seeds" in runner
     assert '[[ -f "${adapter_dir}/adapter_model.safetensors" || -f "${adapter_dir}/adapter_model.bin" ]]' in runner
     assert "Only one fine-tuned variant is allowed per RUN_DIR" in runner
 
@@ -197,3 +337,10 @@ def test_t2v_generator_marks_1k_dict_manifest_as_test(monkeypatch, tmp_path: Pat
     assert samples[0]["source_split"] == "test"
     assert samples[0]["source_bucket"] == "1k"
     assert samples[0]["scene_id"] == scene_uid.split("/", 1)[1]
+
+
+def test_t2v_generator_can_use_per_sample_seed(monkeypatch) -> None:
+    module = load_t2v_generator_module(monkeypatch)
+    sample = {"group_id": "prompt_000017", "seed": 100017}
+    assert module.sample_seed_list(sample, [456], use_sample_seeds=True) == [100017]
+    assert module.sample_seed_list(sample, [456], use_sample_seeds=False) == [456]

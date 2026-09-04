@@ -61,3 +61,10 @@ def test_a14b_eval_multigpu_defaults_enable_sequence_parallel() -> None:
     assert "${T5_FSDP:-1}" in launcher
     assert "${USE_SP:-1}" in launcher
     assert "--ulysses_size" in launcher
+
+
+def test_a14b_generator_accepts_fixed_eval_sample_seeds() -> None:
+    entrypoint = (REPO_ROOT / "VideoGPA/generate/Wan2.2-A14B.py").read_text(encoding="utf-8")
+
+    assert "--use_sample_seeds" in entrypoint
+    assert "sample_seed_list(item, seeds, args.use_sample_seeds)" in entrypoint

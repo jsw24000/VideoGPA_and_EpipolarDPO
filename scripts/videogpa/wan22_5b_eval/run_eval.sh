@@ -12,6 +12,8 @@ TASK="${TASK:-}"
 EVAL_NAME="${EVAL_NAME:-dl3dv1k_seed456}"
 SEED="${SEED:-456}"
 LIMIT="${LIMIT:-100}"
+EVAL_MANIFEST="${EVAL_MANIFEST:-}"
+PER_SAMPLE_SEEDS="${PER_SAMPLE_SEEDS:-0}"
 GPU_ID="${GPU_ID:-0}"
 GPU_IDS="${GPU_IDS:-${GPU_ID}}"
 SCORE_DEVICES="${SCORE_DEVICES:-${GPU_IDS}}"
@@ -49,6 +51,14 @@ while [[ $# -gt 0 ]]; do
     --limit)
       LIMIT="$2"
       shift 2
+      ;;
+    --eval-manifest)
+      EVAL_MANIFEST="$2"
+      shift 2
+      ;;
+    --per-sample-seeds)
+      PER_SAMPLE_SEEDS=1
+      shift
       ;;
     --variant|--variants)
       EVAL_VARIANT="$2"
@@ -162,6 +172,14 @@ case "${RUN_BASELINE}" in
     exit 2
     ;;
 esac
+case "${PER_SAMPLE_SEEDS}" in
+  1|true|TRUE|yes|YES) PER_SAMPLE_SEEDS=1 ;;
+  0|false|FALSE|no|NO) PER_SAMPLE_SEEDS=0 ;;
+  *)
+    printf 'PER_SAMPLE_SEEDS must be 0/1 or true/false, got %s\n' "${PER_SAMPLE_SEEDS}" >&2
+    exit 2
+    ;;
+esac
 if [[ "${EVAL_VARIANT}" == *,* ]]; then
   printf 'Only one fine-tuned variant is allowed per RUN_DIR; got: %s\n' "${EVAL_VARIANT}" >&2
   exit 2
@@ -220,6 +238,8 @@ fi
   printf 'TASK=%s\n' "${TASK}"
   printf 'SEED=%s\n' "${SEED}"
   printf 'LIMIT=%s\n' "${LIMIT}"
+  printf 'EVAL_MANIFEST=%s\n' "${EVAL_MANIFEST}"
+  printf 'PER_SAMPLE_SEEDS=%s\n' "${PER_SAMPLE_SEEDS}"
   printf 'GPU_IDS=%s\n' "${GPU_IDS}"
   printf 'SCORE_DEVICES=%s\n' "${SCORE_DEVICES}"
   printf 'RUN_BASELINE=%s\n' "${RUN_BASELINE}"
@@ -231,13 +251,34 @@ fi
   printf 'RUN_CONFIG_SCALE=%s\n' "${RUN_CONFIG_SCALE}"
 } > "${CONFIG_DIR}/environment.txt"
 
-if [[ "${FORCE_MANIFEST}" == "1" ]] && find "${GEN_DIR}" -type f -name "seed_${SEED}.mp4" -print -quit 2>/dev/null | grep -q .; then
-  printf 'Refusing --force-manifest because generated seed_%s videos already exist under %s. Use a new --eval-name or remove the old eval directory first.\n' \
-    "${SEED}" "${GEN_DIR}" >&2
+MANIFEST_FORCE_VIDEO_PATTERN="seed_${SEED}.mp4"
+if [[ "${PER_SAMPLE_SEEDS}" == "1" ]]; then
+  MANIFEST_FORCE_VIDEO_PATTERN="*.mp4"
+fi
+if [[ "${FORCE_MANIFEST}" == "1" ]] && find "${GEN_DIR}" -type f -name "${MANIFEST_FORCE_VIDEO_PATTERN}" -print -quit 2>/dev/null | grep -q .; then
+  printf 'Refusing --force-manifest because generated videos already exist under %s. Use a new --eval-name or remove the old eval directory first.\n' \
+    "${GEN_DIR}" >&2
   exit 2
 fi
 
-if [[ ! -f "${MANIFEST_PATH}" || "${FORCE_MANIFEST}" == "1" ]]; then
+if [[ -n "${EVAL_MANIFEST}" ]]; then
+  if [[ ! -f "${EVAL_MANIFEST}" ]]; then
+    printf 'Eval manifest not found: %s\n' "${EVAL_MANIFEST}" >&2
+    exit 2
+  fi
+  EVAL_MANIFEST="$(cd "$(dirname "${EVAL_MANIFEST}")" && pwd)/$(basename "${EVAL_MANIFEST}")"
+  if [[ ! -f "${MANIFEST_PATH}" || "${FORCE_MANIFEST}" == "1" ]]; then
+    cp "${EVAL_MANIFEST}" "${MANIFEST_PATH}"
+    printf '[run_eval] copied fixed eval manifest: %s -> %s\n' "${EVAL_MANIFEST}" "${MANIFEST_PATH}"
+  elif ! cmp -s "${EVAL_MANIFEST}" "${MANIFEST_PATH}"; then
+    printf 'Existing eval manifest differs from --eval-manifest. Use a new --eval-name, or --force-manifest before generation exists.\n' >&2
+    printf '  existing: %s\n' "${MANIFEST_PATH}" >&2
+    printf '  requested: %s\n' "${EVAL_MANIFEST}" >&2
+    exit 2
+  else
+    printf '[run_eval] using existing fixed eval manifest: %s\n' "${MANIFEST_PATH}"
+  fi
+elif [[ ! -f "${MANIFEST_PATH}" || "${FORCE_MANIFEST}" == "1" ]]; then
   "${PY_CMD[@]}" "${SCRIPT_DIR}/make_eval_manifest.py" \
     --output "${MANIFEST_PATH}" \
     --seed "${SEED}" \
@@ -246,12 +287,16 @@ else
   printf '[run_eval] using existing manifest: %s\n' "${MANIFEST_PATH}"
 fi
 
-EXPECTED_SAMPLES="${LIMIT}"
-if [[ "${EXPECTED_SAMPLES}" == "all" ]]; then
-  EXPECTED_SAMPLES=1000
-fi
 MANIFEST_SAMPLES="$("${PY_CMD[@]}" -c 'import json, sys; data=json.load(open(sys.argv[1], encoding="utf-8")); print(data.get("num_samples", ""))' "${MANIFEST_PATH}")"
 MANIFEST_SEED="$("${PY_CMD[@]}" -c 'import json, sys; data=json.load(open(sys.argv[1], encoding="utf-8")); print(data.get("seed", ""))' "${MANIFEST_PATH}")"
+if [[ -n "${EVAL_MANIFEST}" ]]; then
+  EXPECTED_SAMPLES="${MANIFEST_SAMPLES}"
+else
+  EXPECTED_SAMPLES="${LIMIT}"
+  if [[ "${EXPECTED_SAMPLES}" == "all" ]]; then
+    EXPECTED_SAMPLES=1000
+  fi
+fi
 if [[ "${MANIFEST_SAMPLES}" != "${EXPECTED_SAMPLES}" || "${MANIFEST_SEED}" != "${SEED}" ]]; then
   printf 'Existing eval manifest does not match this run: samples=%s seed=%s, expected samples=%s seed=%s. Remove %s or choose a new --eval-name.\n' \
     "${MANIFEST_SAMPLES}" "${MANIFEST_SEED}" "${EXPECTED_SAMPLES}" "${SEED}" "${EVAL_DIR}" >&2
@@ -343,10 +388,19 @@ assert_variant_video_count() {
     printf 'Generation directory missing for %s: %s\n' "${variant}" "${base_dir}" >&2
     exit 1
   fi
-  actual="$(find "${base_dir}" -type f -name "seed_${SEED}.mp4" -size +0c 2>/dev/null | wc -l)"
+  if [[ "${PER_SAMPLE_SEEDS}" == "1" ]]; then
+    actual="$(find "${base_dir}" -mindepth 2 -maxdepth 2 -type f -name "*.mp4" -size +0c 2>/dev/null | wc -l)"
+  else
+    actual="$(find "${base_dir}" -type f -name "seed_${SEED}.mp4" -size +0c 2>/dev/null | wc -l)"
+  fi
   if [[ "${actual}" != "${EXPECTED_SAMPLES}" ]]; then
-    printf 'Expected exactly %s seed_%s videos for %s, found %s under %s. Refusing to score stale or incomplete output.\n' \
-      "${EXPECTED_SAMPLES}" "${SEED}" "${variant}" "${actual}" "${base_dir}" >&2
+    if [[ "${PER_SAMPLE_SEEDS}" == "1" ]]; then
+      printf 'Expected exactly %s per-sample-seeded mp4 videos for %s, found %s under %s. Refusing to score stale or incomplete output.\n' \
+        "${EXPECTED_SAMPLES}" "${variant}" "${actual}" "${base_dir}" >&2
+    else
+      printf 'Expected exactly %s seed_%s videos for %s, found %s under %s. Refusing to score stale or incomplete output.\n' \
+        "${EXPECTED_SAMPLES}" "${SEED}" "${variant}" "${actual}" "${base_dir}" >&2
+    fi
     exit 1
   fi
 }
@@ -428,6 +482,12 @@ generate_variant() {
     fi
     lora_args+=(--lora_path "${lora_path}" --lora_weight "${lora_weight}")
   fi
+  local seed_args=()
+  if [[ "${PER_SAMPLE_SEEDS}" == "1" ]]; then
+    seed_args+=(--use_sample_seeds)
+  else
+    seed_args+=(--candidate_seeds "${SEED}")
+  fi
 
   mkdir -p "${out_dir}"
   IFS=',' read -r -a gpu_list <<< "${GPU_IDS}"
@@ -456,7 +516,7 @@ generate_variant() {
         --output_dir "${out_dir}" \
         --candidate_groups_json "${MANIFEST_DIR}/${variant}.candidate_groups.json" \
         --gpu_id 0 \
-        --candidate_seeds "${SEED}" \
+        "${seed_args[@]}" \
         --candidates_per_prompt 1 \
         "${extra_args[@]}" \
         "${lora_args[@]}" \
@@ -469,7 +529,7 @@ generate_variant() {
         --output_dir "${out_dir}" \
         --candidate_groups_json "${MANIFEST_DIR}/${variant}.candidate_groups.json" \
         --gpu_id "${GPU_ID}" \
-        --candidate_seeds "${SEED}" \
+        "${seed_args[@]}" \
         --candidates_per_prompt 1 \
         "${lora_args[@]}" \
         "${force_args[@]}" 2>&1 | tee "${LOG_DIR}/generate_${variant}.log"
@@ -492,7 +552,7 @@ generate_variant() {
           --output_dir "${out_dir}" \
           --candidate_groups_json "${shard_manifest}" \
           --gpu_id "${gpu}" \
-          --candidate_seeds "${SEED}" \
+          "${seed_args[@]}" \
           --candidates_per_prompt 1 \
           --shard_index "${shard_index}" \
           --num_shards "${#gpu_list[@]}" \
@@ -524,7 +584,7 @@ generate_variant() {
       --output_dir "${out_dir}" \
       --candidate_groups_json "${MANIFEST_DIR}/${variant}.candidate_groups.json" \
       --gpu_id "${GPU_ID}" \
-      --candidate_seeds "${SEED}" \
+      "${seed_args[@]}" \
       --candidates_per_prompt 1 \
       "${lora_args[@]}" \
       "${force_args[@]}" 2>&1 | tee "${LOG_DIR}/generate_${variant}.log"
@@ -559,7 +619,7 @@ score_variant() {
     SCORE_NUM_FRAMES="${SCORE_NUM_FRAMES:-10}" \
     SCORE_CONF_THRES="${SCORE_CONF_THRES:-0}" \
     SCORE_RESUME=1 \
-    SCORE_SEED_FILTER="${SEED}" \
+    SCORE_SEED_FILTER="$([[ "${PER_SAMPLE_SEEDS}" == "1" ]] && printf '' || printf '%s' "${SEED}")" \
     SCORE_OUTPUT_CSV="${out_dir}/${variant}_scores.csv" \
     SCORE_OUTPUT_JSON="${out_dir}/${variant}_scores.json" \
     "${PY_CMD[@]}" replicate_scorer.py

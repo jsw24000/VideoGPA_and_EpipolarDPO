@@ -84,6 +84,24 @@ def parse_seed_list(text: str | None, cfg: dict[str, Any]) -> list[int]:
     return [int(seed) for seed in seeds]
 
 
+def sample_seed_list(item: dict[str, Any], default_seeds: list[int], use_sample_seeds: bool) -> list[int]:
+    if not use_sample_seeds:
+        return list(default_seeds)
+    raw_seeds = item.get("seeds")
+    if raw_seeds is not None:
+        if isinstance(raw_seeds, list):
+            seeds = [int(seed) for seed in raw_seeds]
+        else:
+            seeds = [int(seed.strip()) for seed in str(raw_seeds).split(",") if seed.strip()]
+    elif item.get("seed") is not None:
+        seeds = [int(item["seed"])]
+    else:
+        raise ValueError(f"--use_sample_seeds requires each sample to contain seed or seeds: {item.get('group_id')}")
+    if not seeds:
+        raise ValueError(f"Empty sample seeds for {item.get('group_id')}")
+    return seeds
+
+
 def parse_size(size: str) -> tuple[int, int]:
     if size not in SIZE_CONFIGS:
         if "*" not in size:
@@ -394,9 +412,10 @@ def generate(args: argparse.Namespace) -> None:
     print(f"  output_manifest={output_manifest}")
     print(f"  lora_path={lora_path}")
     print("Generation args:")
+    seed_text = "per-sample" if args.use_sample_seeds else str(seeds)
     print(
         f"  task=i2v img=first_frame size_target={size_text} max_area={max_area} frame_num={frame_num} "
-        f"steps={sampling_steps} shift={shift} guide_scale={guide_scale} seeds={seeds}"
+        f"steps={sampling_steps} shift={shift} guide_scale={guide_scale} seeds={seed_text}"
     )
 
     if not input_json.exists():
@@ -439,7 +458,10 @@ def generate(args: argparse.Namespace) -> None:
         group_dir = output_dir / group_id
         group_dir.mkdir(parents=True, exist_ok=True)
         videos = []
-        for seed in seeds:
+        item_seeds = sample_seed_list(item, seeds, args.use_sample_seeds)
+        if args.candidates_per_prompt:
+            item_seeds = item_seeds[: args.candidates_per_prompt]
+        for seed in item_seeds:
             video_path = group_dir / f"seed_{seed}.mp4"
             if existing_video_ok(video_path, frame_num) and not args.force:
                 print(f"[{idx + 1}/{len(samples)}] Skip valid existing {video_path}")
@@ -531,6 +553,7 @@ def generate(args: argparse.Namespace) -> None:
             "t5_cpu": t5_cpu,
             "convert_model_dtype": convert_model_dtype,
             "seeds": seeds,
+            "use_sample_seeds": bool(args.use_sample_seeds),
             "shard_index": args.shard_index,
             "num_shards": args.num_shards,
         },
@@ -555,6 +578,7 @@ def main() -> None:
     parser.add_argument("--gpu_id", type=int, default=0)
     parser.add_argument("--candidate_seeds", type=str, default=None)
     parser.add_argument("--candidates_per_prompt", type=int, default=None)
+    parser.add_argument("--use_sample_seeds", "--use-sample-seeds", action="store_true")
     parser.add_argument("--seed", type=int, default=None, help="Compatibility alias for one candidate seed")
     parser.add_argument("--num_prompts", type=int, default=None)
     parser.add_argument("--shard_index", type=int, default=0)
