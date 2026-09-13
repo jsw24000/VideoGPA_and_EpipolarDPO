@@ -31,6 +31,9 @@ STRICT_TRAINING_KEYS = (
     "num_train_timesteps",
     "shift",
     "gradient_clip_val",
+    "expert_mode",
+    "reference_mode",
+    "timestep_mode",
 )
 
 PATH_FIELDS_ALLOWED_TO_DRIFT = (
@@ -122,6 +125,7 @@ def validate_checkpoint_manifest(checkpoint_dir: str | Path) -> dict[str, Path |
     dual_adapter_configs = files.get("dual_adapter_configs")
     is_dual = False
     dual_present = False
+    present_experts: list[str] = []
     if isinstance(dual_adapter_models, dict) and isinstance(dual_adapter_configs, dict):
         dual_present = any(
             (root / expert).exists()
@@ -135,6 +139,13 @@ def validate_checkpoint_manifest(checkpoint_dir: str | Path) -> dict[str, Path |
             and Path(dual_adapter_configs[expert]).is_file()
             for expert in ("low_noise_model", "high_noise_model")
         )
+        present_experts = [
+            expert
+            for expert in ("low_noise_model", "high_noise_model")
+            if isinstance(dual_adapter_models.get(expert), Path)
+            and Path(dual_adapter_models[expert]).is_file()
+            and Path(dual_adapter_configs[expert]).is_file()
+        ]
 
     required = {
         "optimizer": files["optimizer"],
@@ -143,14 +154,11 @@ def validate_checkpoint_manifest(checkpoint_dir: str | Path) -> dict[str, Path |
         "config_resolved": files["config_resolved"],
     }
     if is_dual or dual_present:
-        required.update(
-            {
-                "low_noise_model.adapter_model": dual_adapter_models["low_noise_model"],
-                "low_noise_model.adapter_config": dual_adapter_configs["low_noise_model"],
-                "high_noise_model.adapter_model": dual_adapter_models["high_noise_model"],
-                "high_noise_model.adapter_config": dual_adapter_configs["high_noise_model"],
-            }
-        )
+        for expert in ("low_noise_model", "high_noise_model"):
+            expert_root_exists = (root / expert).exists()
+            if expert_root_exists or expert in present_experts:
+                required[f"{expert}.adapter_model"] = dual_adapter_models[expert]
+                required[f"{expert}.adapter_config"] = dual_adapter_configs[expert]
     else:
         required.update(
             {
@@ -164,6 +172,7 @@ def validate_checkpoint_manifest(checkpoint_dir: str | Path) -> dict[str, Path |
             missing.append(label)
     if missing:
         raise FileNotFoundError(f"Checkpoint {root} is missing required file(s): {', '.join(missing)}")
+    files["present_experts"] = present_experts
     return files
 
 
@@ -213,6 +222,9 @@ def normalize_training_config(config: dict[str, Any]) -> dict[str, Any]:
                 break
     if "lora_target_modules" in normalized:
         normalized["lora_target_modules"] = list(normalized["lora_target_modules"])
+    normalized.setdefault("expert_mode", "both")
+    normalized.setdefault("reference_mode", "separate")
+    normalized.setdefault("timestep_mode", "legacy_unshifted_model_input")
     return normalized
 
 

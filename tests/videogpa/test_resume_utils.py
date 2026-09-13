@@ -56,6 +56,19 @@ def make_dual_checkpoint(root: Path, name: str = "step_005000") -> Path:
     return checkpoint
 
 
+def make_single_expert_checkpoint(root: Path, expert: str, name: str = "step_005000") -> Path:
+    checkpoint = root / name
+    checkpoint.mkdir(parents=True)
+    write_file(checkpoint / expert / "adapter_model.safetensors")
+    write_file(checkpoint / expert / "adapter_config.json", "{}")
+    write_file(checkpoint / "optimizer.pt")
+    write_file(checkpoint / "scheduler.pt")
+    write_file(checkpoint / "trainer_state.json", '{"step": 5000}')
+    with (checkpoint / "config_resolved.yaml").open("w", encoding="utf-8") as handle:
+        yaml.safe_dump({"training_resolved": base_training_config()}, handle)
+    return checkpoint
+
+
 def base_training_config() -> dict[str, object]:
     return {
         "lora_rank": 64,
@@ -104,6 +117,17 @@ def test_validate_checkpoint_manifest_accepts_dual_expert_adapters(tmp_path: Pat
 
     (checkpoint / "high_noise_model" / "adapter_config.json").unlink()
     with pytest.raises(FileNotFoundError, match="high_noise_model.adapter_config"):
+        validate_checkpoint_manifest(checkpoint)
+
+
+@pytest.mark.parametrize("expert", ["low_noise_model", "high_noise_model"])
+def test_validate_checkpoint_manifest_accepts_single_expert_adapter(tmp_path: Path, expert: str) -> None:
+    checkpoint = make_single_expert_checkpoint(tmp_path, expert)
+    files = validate_checkpoint_manifest(checkpoint)
+    assert files["present_experts"] == [expert]
+
+    (checkpoint / expert / "adapter_config.json").unlink()
+    with pytest.raises(FileNotFoundError, match=f"{expert}.adapter_config"):
         validate_checkpoint_manifest(checkpoint)
 
 

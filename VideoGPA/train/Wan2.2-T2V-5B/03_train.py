@@ -16,7 +16,7 @@ import os
 import random
 import sys
 import time
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -93,6 +93,9 @@ DEFAULT_CONFIG = {
     "seed": 2026,
     "device": 0,
     "save_steps": 5,
+    "expert_mode": "both",
+    "reference_mode": "separate",
+    "timestep_mode": "legacy_unshifted_model_input",
 }
 
 
@@ -228,6 +231,9 @@ def resolve_config(args: argparse.Namespace) -> dict[str, Any]:
             "enable_gradient_checkpointing": yaml_train.get(
                 "enable_gradient_checkpointing", train_cfg["enable_gradient_checkpointing"]
             ),
+            "expert_mode": yaml_train.get("expert_mode", train_cfg["expert_mode"]),
+            "reference_mode": yaml_train.get("reference_mode", train_cfg["reference_mode"]),
+            "timestep_mode": yaml_train.get("timestep_mode", train_cfg["timestep_mode"]),
         }
     )
     if "num_train_timesteps" not in yaml_train and hasattr(wan_cfg, "num_train_timesteps"):
@@ -250,6 +256,22 @@ def resolve_config(args: argparse.Namespace) -> dict[str, Any]:
         train_cfg["warmup_steps"] = args.warmup_steps
     if args.device is not None:
         train_cfg["device"] = args.device
+    if args.expert_mode is not None:
+        train_cfg["expert_mode"] = args.expert_mode
+    if args.reference_mode is not None:
+        train_cfg["reference_mode"] = args.reference_mode
+    if args.timestep_mode is not None:
+        train_cfg["timestep_mode"] = args.timestep_mode
+    if args.training_shift is not None:
+        train_cfg["shift"] = args.training_shift
+    if train_cfg["expert_mode"] not in {"both", "high", "low"}:
+        raise ValueError(f"Unsupported expert_mode={train_cfg['expert_mode']!r}")
+    if train_cfg["reference_mode"] not in {"separate", "shared_base"}:
+        raise ValueError(f"Unsupported reference_mode={train_cfg['reference_mode']!r}")
+    if train_cfg["timestep_mode"] not in {"legacy_unshifted_model_input", "shifted_scheduler"}:
+        raise ValueError(f"Unsupported timestep_mode={train_cfg['timestep_mode']!r}")
+    if architecture != "dual_expert_a14b" and train_cfg["expert_mode"] != "both":
+        raise ValueError("expert_mode=high/low is only valid for dual_expert_a14b")
     cfg["training_resolved"] = train_cfg
     return cfg
 
@@ -353,11 +375,86 @@ def is_dual_expert(cfg: dict[str, Any]) -> bool:
     return str(cfg.get("architecture", "")) == "dual_expert_a14b"
 
 
+def expert_checkpoint_name(cfg: dict[str, Any]) -> str | None:
+    mode = str(cfg.get("expert_mode", "both"))
+    return f"{mode}_noise_model" if mode in {"high", "low"} else None
+
+
 def checkpoint_is_dual(resume_files: dict[str, Any] | None) -> bool:
     if resume_files is None:
         return False
     dual_models = resume_files.get("dual_adapter_models")
     return isinstance(dual_models, dict) and all(dual_models.get(name) for name in ("low_noise_model", "high_noise_model"))
+
+
+def checkpoint_has_expected_experts(resume_files: dict[str, Any], cfg: dict[str, Any]) -> bool:
+    dual_models = resume_files.get("dual_adapter_models")
+    if not isinstance(dual_models, dict):
+        return False
+    expected = expert_checkpoint_name(cfg)
+    if expected is not None:
+        return bool(dual_models.get(expected)) and not bool(
+            dual_models.get("low_noise_model" if expected == "high_noise_model" else "high_noise_model")
+        )
+    return checkpoint_is_dual(resume_files)
+
+
+def sample_training_timesteps(cfg: dict[str, Any], batch_size: int, device: torch.device) -> torch.Tensor:
+    total = int(cfg["num_train_timesteps"])
+    boundary_fraction = float(cfg["boundary"])
+    if cfg.get("timestep_mode") == "shifted_scheduler":
+        shift = float(cfg["shift"])
+        boundary_fraction = boundary_fraction / (shift - (shift - 1.0) * boundary_fraction)
+    boundary = int(math.ceil(boundary_fraction * total))
+    mode = str(cfg.get("expert_mode", "both"))
+    if mode == "high":
+        low, high = boundary, total
+    elif mode == "low":
+        low, high = 1, boundary
+    else:
+        low, high = 1, total
+    if low >= high:
+        raise ValueError(f"Empty timestep interval for expert_mode={mode}: [{low}, {high})")
+    return torch.randint(low, high, (batch_size,), device=device)
+
+
+def peft_models(model: torch.nn.Module) -> list[torch.nn.Module]:
+    base = unwrap_model(model)
+    if isinstance(base, DualExpertModel):
+        return [base.low_noise_model, base.high_noise_model]
+    return [base]
+
+
+@contextmanager
+def shared_base_reference(model: torch.nn.Module):
+    base = unwrap_model(model)
+    was_training = base.training
+    base.eval()
+    try:
+        with ExitStack() as stack:
+            for peft_model in peft_models(base):
+                disable_adapter = getattr(peft_model, "disable_adapter", None)
+                if disable_adapter is None:
+                    raise RuntimeError("reference_mode=shared_base requires PEFT disable_adapter() support")
+                stack.enter_context(disable_adapter())
+            yield base
+    finally:
+        base.train(was_training)
+
+
+def cuda_memory_snapshot(device: torch.device, label: str, rank: int) -> dict[str, Any]:
+    row: dict[str, Any] = {"label": label, "rank": rank, "time": dt.datetime.now().isoformat()}
+    if device.type == "cuda":
+        row.update(
+            {
+                "allocated_gb": torch.cuda.memory_allocated(device) / (1024**3),
+                "reserved_gb": torch.cuda.memory_reserved(device) / (1024**3),
+                "max_allocated_gb": torch.cuda.max_memory_allocated(device) / (1024**3),
+                "max_reserved_gb": torch.cuda.max_memory_reserved(device) / (1024**3),
+                "total_memory_gb": torch.cuda.get_device_properties(device).total_memory / (1024**3),
+            }
+        )
+    return row
 
 
 def create_ti2v_mask(reference: torch.Tensor) -> torch.Tensor:
@@ -757,7 +854,7 @@ def make_data_iterator_at_cursor(
 
 def shared_step(
     transformer: torch.nn.Module,
-    ref_transformer: torch.nn.Module,
+    ref_transformer: torch.nn.Module | None,
     loss_fn: torch.nn.Module,
     batch: dict[str, Any],
     cfg: dict[str, Any],
@@ -774,13 +871,16 @@ def shared_step(
     batch_size = x_win.shape[0]
     patch_size = tuple(cfg["patch_size"])
     seq_len = compute_seq_len(x_win, patch_size)
-    timesteps = torch.randint(1, int(cfg["num_train_timesteps"]), (batch_size,), device=device)
+    timesteps = sample_training_timesteps(cfg, batch_size, device)
     sigma = get_sigma_from_timestep(timesteps, int(cfg["num_train_timesteps"]), float(cfg["shift"]))
     noise = torch.randn_like(x_win)
 
     x_win_noisy = flow_matching_add_noise(x_win, noise, sigma)
     x_lose_noisy = flow_matching_add_noise(x_lose, noise, sigma)
-    t_model = timesteps
+    if cfg.get("timestep_mode") == "shifted_scheduler":
+        t_model = sigma * int(cfg["num_train_timesteps"])
+    else:
+        t_model = timesteps
     y_list: list[torch.Tensor] | None = None
     image_latent_shape: list[int] | None = None
     i2v_y_shape: list[int] | None = None
@@ -812,9 +912,15 @@ def shared_step(
     if y_list is not None:
         common_kwargs["y"] = y_list
 
-    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-        v_win_ref = torch.stack(ref_transformer(x_win_input, **common_kwargs))
-        v_lose_ref = torch.stack(ref_transformer(x_lose_input, **common_kwargs))
+    if ref_transformer is None:
+        with shared_base_reference(transformer) as reference_model:
+            with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                v_win_ref = torch.stack(reference_model(x_win_input, **common_kwargs))
+                v_lose_ref = torch.stack(reference_model(x_lose_input, **common_kwargs))
+    else:
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            v_win_ref = torch.stack(ref_transformer(x_win_input, **common_kwargs))
+            v_lose_ref = torch.stack(ref_transformer(x_lose_input, **common_kwargs))
     with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
         v_win_pred = torch.stack(transformer(x_win_input, **common_kwargs))
         v_lose_pred = torch.stack(transformer(x_lose_input, **common_kwargs))
@@ -840,11 +946,16 @@ def shared_step(
         lose_policy_err = (v_lose_pred.float() - v_lose_target).pow(2).mean().item()
         win_ref_err = (v_win_ref.float() - v_win_target).pow(2).mean().item()
         lose_ref_err = (v_lose_ref.float() - v_lose_target).pow(2).mean().item()
+        policy_reference_max_abs_diff = max(
+            (v_win_pred.detach().float() - v_win_ref.float()).abs().max().item(),
+            (v_lose_pred.detach().float() - v_lose_ref.float()).abs().max().item(),
+        )
     debug = {
         "winner_policy_error": win_policy_err,
         "loser_policy_error": lose_policy_err,
         "winner_reference_error": win_ref_err,
         "loser_reference_error": lose_ref_err,
+        "policy_reference_max_abs_diff": policy_reference_max_abs_diff,
         "winner_loser_latent_shape": list(x_win.shape),
         "timestep_shape": list(timesteps.shape),
         "noise_shape": list(noise.shape),
@@ -852,6 +963,12 @@ def shared_step(
         "seq_len": seq_len,
         "task": task,
         "architecture": architecture,
+        "expert_mode": cfg.get("expert_mode", "both"),
+        "timestep_min": int(timesteps.min().item()),
+        "timestep_max": int(timesteps.max().item()),
+        "model_timestep_min": float(t_model.min().item()),
+        "model_timestep_max": float(t_model.max().item()),
+        "timestep_mode": cfg.get("timestep_mode"),
         "loss_strategy": cfg.get("loss_strategy", "dpo"),
         "loss_metrics": loss_metrics,
     }
@@ -862,7 +979,9 @@ def shared_step(
     return loss_out, debug
 
 
-def load_lora_adapters_for_model(model: torch.nn.Module, resume_files: dict[str, Any]) -> dict[str, Any]:
+def load_lora_adapters_for_model(
+    model: torch.nn.Module, resume_files: dict[str, Any], cfg: dict[str, Any]
+) -> dict[str, Any]:
     if isinstance(model, DualExpertModel):
         dual_models = resume_files.get("dual_adapter_models")
         if not isinstance(dual_models, dict):
@@ -871,22 +990,42 @@ def load_lora_adapters_for_model(model: torch.nn.Module, resume_files: dict[str,
             "low_noise_model": load_lora_adapter_strict(model.low_noise_model, Path(dual_models["low_noise_model"])),
             "high_noise_model": load_lora_adapter_strict(model.high_noise_model, Path(dual_models["high_noise_model"])),
         }
-    adapter_model = resume_files.get("adapter_model")
+    expected_single = expert_checkpoint_name(cfg)
+    if expected_single is not None:
+        dual_models = resume_files.get("dual_adapter_models")
+        adapter_model = dual_models.get(expected_single) if isinstance(dual_models, dict) else None
+    else:
+        adapter_model = resume_files.get("adapter_model")
     if adapter_model is None:
         raise RuntimeError("Single-expert resume checkpoint is missing adapter_model")
     return load_lora_adapter_strict(model, Path(adapter_model))
 
 
-def save_model_adapters(model: torch.nn.Module, checkpoint_dir: Path) -> None:
+def save_model_adapters(model: torch.nn.Module, checkpoint_dir: Path, cfg: dict[str, Any]) -> None:
     if isinstance(model, DualExpertModel):
         model.low_noise_model.save_pretrained(checkpoint_dir / "low_noise_model")
         model.high_noise_model.save_pretrained(checkpoint_dir / "high_noise_model")
+    elif expert_checkpoint_name(cfg) is not None:
+        model.save_pretrained(checkpoint_dir / str(expert_checkpoint_name(cfg)))
     else:
         model.save_pretrained(checkpoint_dir)
 
 
 def assert_checkpoint_adapter_layout(checkpoint_dir: Path, cfg: dict[str, Any]) -> None:
-    if is_dual_expert(cfg):
+    expected_single = expert_checkpoint_name(cfg)
+    if expected_single is not None:
+        expert_dir = checkpoint_dir / expected_single
+        missing = []
+        if not (expert_dir / "adapter_config.json").is_file():
+            missing.append(f"{expected_single}/adapter_config.json")
+        if not any((expert_dir / name).is_file() for name in ("adapter_model.safetensors", "adapter_model.bin")):
+            missing.append(f"{expected_single}/adapter_model")
+        other = "low_noise_model" if expected_single == "high_noise_model" else "high_noise_model"
+        if (checkpoint_dir / other).exists():
+            missing.append(f"unexpected_{other}")
+        if missing:
+            raise RuntimeError(f"Invalid single-expert adapter checkpoint in {checkpoint_dir}: {', '.join(missing)}")
+    elif is_dual_expert(cfg):
         missing = []
         for expert in ("low_noise_model", "high_noise_model"):
             expert_dir = checkpoint_dir / expert
@@ -901,6 +1040,14 @@ def assert_checkpoint_adapter_layout(checkpoint_dir: Path, cfg: dict[str, Any]) 
 
 
 def reload_checkpoint_smoke(model_path: Path, checkpoint_dir: Path, cfg: dict[str, Any]) -> None:
+    expected_single = expert_checkpoint_name(cfg)
+    if expected_single is not None:
+        wan_cfg = WAN_CONFIGS[str(cfg["wan_task_key"])]
+        subfolder = getattr(wan_cfg, f"{cfg['expert_mode']}_noise_checkpoint")
+        reload_base = WanModel.from_pretrained(str(model_path), subfolder=subfolder)
+        reloaded = PeftModel.from_pretrained(reload_base, str(checkpoint_dir / expected_single), adapter_name="default")
+        del reloaded, reload_base
+        return
     if is_dual_expert(cfg):
         wan_cfg = WAN_CONFIGS[str(cfg["wan_task_key"])]
         low_base = WanModel.from_pretrained(str(model_path), subfolder=wan_cfg.low_noise_checkpoint)
@@ -917,6 +1064,12 @@ def reload_checkpoint_smoke(model_path: Path, checkpoint_dir: Path, cfg: dict[st
 def build_policy_model(model_path: Path, cfg: dict[str, Any], lora_config: LoraConfig, device: torch.device) -> torch.nn.Module:
     if is_dual_expert(cfg):
         wan_cfg = WAN_CONFIGS[str(cfg["wan_task_key"])]
+        mode = str(cfg.get("expert_mode", "both"))
+        if mode in {"high", "low"}:
+            subfolder = getattr(wan_cfg, f"{mode}_noise_checkpoint")
+            model = WanModel.from_pretrained(str(model_path), subfolder=subfolder)
+            model.to(device=device, dtype=torch.bfloat16)
+            return get_peft_model(model, lora_config).to(device)
         low = WanModel.from_pretrained(str(model_path), subfolder=wan_cfg.low_noise_checkpoint)
         high = WanModel.from_pretrained(str(model_path), subfolder=wan_cfg.high_noise_checkpoint)
         low.to(device=device, dtype=torch.bfloat16)
@@ -933,6 +1086,14 @@ def build_policy_model(model_path: Path, cfg: dict[str, Any], lora_config: LoraC
 def build_reference_model(model_path: Path, cfg: dict[str, Any], device: torch.device) -> torch.nn.Module:
     if is_dual_expert(cfg):
         wan_cfg = WAN_CONFIGS[str(cfg["wan_task_key"])]
+        mode = str(cfg.get("expert_mode", "both"))
+        if mode in {"high", "low"}:
+            subfolder = getattr(wan_cfg, f"{mode}_noise_checkpoint")
+            model = WanModel.from_pretrained(str(model_path), subfolder=subfolder)
+            model.to(device=device, dtype=torch.bfloat16)
+            model.requires_grad_(False)
+            model.eval()
+            return model
         low = WanModel.from_pretrained(str(model_path), subfolder=wan_cfg.low_noise_checkpoint)
         high = WanModel.from_pretrained(str(model_path), subfolder=wan_cfg.high_noise_checkpoint)
         low.to(device=device, dtype=torch.bfloat16)
@@ -956,7 +1117,7 @@ def save_checkpoint(
 ) -> None:
     ensure_checkpoint_save_target_safe(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    save_model_adapters(transformer, checkpoint_dir)
+    save_model_adapters(transformer, checkpoint_dir, state["config"])
     torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
     torch.save(scheduler.state_dict(), checkpoint_dir / "scheduler.pt")
     torch.save(capture_rng_state(), checkpoint_dir / "rng_state.pt")
@@ -976,6 +1137,8 @@ def train(args: argparse.Namespace) -> None:
         metadata_path = Path(args.metadata_path or run_dir / "manifests/encoded_pairs.json").expanduser().resolve()
         output_dir = Path(args.output_dir or run_dir).expanduser().resolve()
         checkpoint_root = output_dir / "checkpoints"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "reports").mkdir(parents=True, exist_ok=True)
         is_main = bool(dist_state["is_main"])
         resume_checkpoint = resolve_resume_checkpoint(args, checkpoint_root)
         resume_files = None
@@ -1000,6 +1163,10 @@ def train(args: argparse.Namespace) -> None:
         log(f"  wan_task_key={cfg['wan_task_key']}")
         log(f"  image-conditioned branch={cfg['task'] == 'i2v'}")
         log(f"  dual_expert={is_dual_expert(cfg)}")
+        log(f"  expert_mode={cfg['expert_mode']}")
+        log(f"  reference_mode={cfg['reference_mode']}")
+        log(f"  timestep_mode={cfg['timestep_mode']}")
+        log(f"  training_shift={cfg['shift']}")
         log(f"  distributed={dist_state['distributed']}")
         log(f"  world_size={dist_state['world_size']}")
         log(f"  batch_size_per_gpu={cfg['batch_size']}")
@@ -1042,6 +1209,17 @@ def train(args: argparse.Namespace) -> None:
         if device.type == "cuda":
             torch.cuda.set_device(device)
             torch.cuda.reset_peak_memory_stats(device)
+        memory_trace_path = output_dir / "reports" / f"memory_trace.rank_{dist_state['rank']}.jsonl"
+
+        def record_memory(label: str) -> None:
+            if not args.memory_probe:
+                return
+            row = cuda_memory_snapshot(device, label, int(dist_state["rank"]))
+            with memory_trace_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            print(json.dumps({"memory_probe": row}, ensure_ascii=False), flush=True)
+
+        record_memory("runtime_initialized")
 
         dataloader, sampler = build_dataloader(run_dir, metadata_path, cfg, dist_state)
         log(f"DPO dataset pairs: {len(dataloader.dataset)}")
@@ -1054,14 +1232,15 @@ def train(args: argparse.Namespace) -> None:
             target_modules=list(cfg["lora_target_modules"]),
         )
         transformer = build_policy_model(model_path, cfg, lora_config, device)
+        record_memory("policy_loaded")
         if cfg.get("enable_gradient_checkpointing"):
             enable_model_gradient_checkpointing(transformer)
         if resume_files is not None:
-            if checkpoint_is_dual(resume_files) != is_dual_expert(cfg):
+            if is_dual_expert(cfg) and not checkpoint_has_expected_experts(resume_files, cfg):
                 raise ResumeError(
-                    f"Checkpoint adapter layout does not match current architecture={cfg['architecture']}"
+                    f"Checkpoint adapter layout does not match expert_mode={cfg['expert_mode']}"
                 )
-            adapter_report = load_lora_adapters_for_model(transformer, resume_files)
+            adapter_report = load_lora_adapters_for_model(transformer, resume_files, cfg)
             resume_report["adapter"] = adapter_report
         stats = trainable_stats(transformer)
         log("LoRA target modules:", cfg["lora_target_modules"])
@@ -1077,7 +1256,7 @@ def train(args: argparse.Namespace) -> None:
         frozen_before = sample_frozen(transformer)
 
         if dist_state["distributed"]:
-            find_unused_default = "1" if is_dual_expert(cfg) else "0"
+            find_unused_default = "1" if is_dual_expert(cfg) and cfg["expert_mode"] == "both" else "0"
             find_unused = os.environ.get("DDP_FIND_UNUSED_PARAMETERS", find_unused_default) == "1"
             transformer = DistributedDataParallel(
                 transformer,
@@ -1086,10 +1265,15 @@ def train(args: argparse.Namespace) -> None:
                 find_unused_parameters=find_unused,
             )
 
-        log(f"Loading frozen reference WanModel from {model_path}")
-        ref_transformer = build_reference_model(model_path, cfg, device)
-        if any("lora_" in name for name, _param in ref_transformer.named_parameters()):
-            raise RuntimeError("Reference model unexpectedly contains LoRA parameters")
+        if cfg["reference_mode"] == "shared_base":
+            log("Using policy base weights with adapters disabled as the frozen reference")
+            ref_transformer = None
+        else:
+            log(f"Loading frozen reference WanModel from {model_path}")
+            ref_transformer = build_reference_model(model_path, cfg, device)
+            if any("lora_" in name for name, _param in ref_transformer.named_parameters()):
+                raise RuntimeError("Reference model unexpectedly contains LoRA parameters")
+        record_memory("reference_ready")
         transformer.train()
 
         loss_fn = create_loss_strategy(strategy=str(cfg["loss_strategy"]), beta=float(cfg["beta"]))
@@ -1104,9 +1288,13 @@ def train(args: argparse.Namespace) -> None:
             scheduler_report = load_scheduler_state_strict(scheduler, resume_files["scheduler"], resume_step)
             resume_report["optimizer"] = optimizer_report
             resume_report["scheduler"] = scheduler_report
-            resume_report["reference_model"] = {"has_lora_parameters": False, "requires_grad": False}
+            resume_report["reference_model"] = {
+                "mode": cfg["reference_mode"],
+                "has_lora_parameters": cfg["reference_mode"] == "shared_base",
+                "requires_grad": False,
+            }
 
-        ref_before = sample_frozen(ref_transformer)
+        ref_before = sample_frozen(ref_transformer if ref_transformer is not None else unwrap_model(transformer))
         metrics = []
         grad_nonzero = False
         accum_steps = max(1, int(cfg["accumulate_grad_batches"]))
@@ -1177,6 +1365,7 @@ def train(args: argparse.Namespace) -> None:
             optimizer.step()
             scheduler.step()
             step += 1
+            record_memory(f"step_{step:06d}_complete")
             allocated = torch.cuda.max_memory_allocated(device) / (1024**3) if device.type == "cuda" else 0.0
             reserved = torch.cuda.max_memory_reserved(device) / (1024**3) if device.type == "cuda" else 0.0
             row = {
@@ -1190,6 +1379,7 @@ def train(args: argparse.Namespace) -> None:
                 "loser_policy_error": debug["loser_policy_error"],
                 "winner_reference_error": debug["winner_reference_error"],
                 "loser_reference_error": debug["loser_reference_error"],
+                "policy_reference_max_abs_diff": debug["policy_reference_max_abs_diff"],
                 "implicit_reward_margin": reward_margin,
                 "grad_norm": grad_value,
                 "optimizer_lr_before_step": optimizer_lr_before_step,
@@ -1239,7 +1429,10 @@ def train(args: argparse.Namespace) -> None:
         policy_model = unwrap_model(transformer)
         lora_delta = trainable_delta(lora_before, policy_model)
         base_changed = frozen_param_changed(policy_model, frozen_before)
-        ref_changed = frozen_param_changed(ref_transformer, ref_before)
+        ref_changed = frozen_param_changed(
+            ref_transformer if ref_transformer is not None else policy_model,
+            ref_before,
+        )
         lora_changed = lora_delta > 0
         adapter_layout_ok = True
         adapter_layout_error = ""
@@ -1281,6 +1474,7 @@ def train(args: argparse.Namespace) -> None:
         if validation_errors:
             raise RuntimeError("; ".join(validation_errors))
 
+        record_memory("training_validated")
         distributed_barrier(dist_state)
         del ref_transformer
         del transformer
@@ -1300,6 +1494,11 @@ def train(args: argparse.Namespace) -> None:
                 "wan_task_key": cfg["wan_task_key"],
                 "image_conditioned_branch": cfg["task"] == "i2v",
                 "dual_expert": is_dual_expert(cfg),
+                "expert_mode": cfg["expert_mode"],
+                "reference_mode": cfg["reference_mode"],
+                "timestep_mode": cfg["timestep_mode"],
+                "training_shift": cfg["shift"],
+                "memory_trace": str(memory_trace_path) if args.memory_probe else None,
                 "distributed": dist_state,
                 "loss_strategy": cfg["loss_strategy"],
                 "effective_global_pair_batch": effective_batch,
@@ -1314,8 +1513,8 @@ def train(args: argparse.Namespace) -> None:
                 "trainable_stats": stats,
                 "metrics": metrics,
             }
-            write_json(run_dir / "reports/training_summary.json", summary)
-            write_resolved_config(run_dir, cfg_all)
+            write_json(output_dir / "reports/training_summary.json", summary)
+            write_resolved_config(output_dir, cfg_all)
             print(f"Training PASS. Checkpoint: {final_ckpt}")
         distributed_barrier(dist_state)
     finally:
@@ -1332,6 +1531,19 @@ def main() -> None:
     parser.add_argument("--max_train_steps", type=int, default=None)
     parser.add_argument("--warmup_steps", "--warmup-steps", type=int, default=None)
     parser.add_argument("--device", type=int, default=None)
+    parser.add_argument("--expert-mode", choices=("both", "high", "low"), default=None)
+    parser.add_argument("--reference-mode", choices=("separate", "shared_base"), default=None)
+    parser.add_argument(
+        "--timestep-mode",
+        choices=("legacy_unshifted_model_input", "shifted_scheduler"),
+        default=None,
+    )
+    parser.add_argument("--training-shift", type=float, default=None)
+    parser.add_argument(
+        "--memory-probe",
+        action="store_true",
+        help="Write per-rank CUDA memory snapshots under output_dir/reports",
+    )
     parser.add_argument("--resume", action="store_true", help="Resume from the latest complete checkpoint under output_dir/checkpoints")
     parser.add_argument("--resume_from_checkpoint", "--resume-from-checkpoint", default=None)
     parser.add_argument(
