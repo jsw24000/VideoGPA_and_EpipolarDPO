@@ -22,6 +22,10 @@ def test_trainer_exposes_memory_safe_a14b_gate_modes() -> None:
     assert "transformer_layer_cls={WanAttentionBlock}" in source
     assert "use_orig_params=True" in source
     assert "model.clip_grad_norm_" in source
+    assert "ignored_states=replicated_trainable" in source
+    assert "param.data = param.data.to(device=device)" in source
+    assert "sync_replicated_trainable_gradients(transformer, dist_state)" in source
+    assert "dist.all_reduce(param.grad" in source
     assert "with shared_base_reference(transformer)" in source
     assert 'mode == "high"' in source
     assert 'mode == "low"' in source

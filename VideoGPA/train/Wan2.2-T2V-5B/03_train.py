@@ -597,7 +597,12 @@ def wrap_fsdp_full_shard(model: torch.nn.Module, device: torch.device) -> torch.
         transformer_auto_wrap_policy,
         transformer_layer_cls={WanAttentionBlock},
     )
-    return FullyShardedDataParallel(
+    replicated_trainable = [param for param in model.parameters() if param.requires_grad]
+    if not replicated_trainable:
+        raise RuntimeError("FSDP LoRA gate found no trainable parameters to replicate")
+    for param in replicated_trainable:
+        param.data = param.data.to(device=device)
+    wrapped = FullyShardedDataParallel(
         model,
         auto_wrap_policy=auto_wrap,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
@@ -611,11 +616,29 @@ def wrap_fsdp_full_shard(model: torch.nn.Module, device: torch.device) -> torch.
         sync_module_states=False,
         limit_all_gathers=True,
         use_orig_params=True,
+        ignored_states=replicated_trainable,
     )
+    wrapped._vgm_replicated_trainable = True
+    return wrapped
+
+
+def sync_replicated_trainable_gradients(
+    model: torch.nn.Module,
+    dist_state: dict[str, int | bool],
+) -> None:
+    if not is_fsdp_model(model) or not getattr(model, "_vgm_replicated_trainable", False):
+        return
+    import torch.distributed as dist
+
+    world_size = int(dist_state["world_size"])
+    for param in model.parameters():
+        if param.requires_grad and param.grad is not None:
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+            param.grad.div_(world_size)
 
 
 def clip_grad_norm(model: torch.nn.Module, max_norm: float) -> torch.Tensor:
-    if is_fsdp_model(model):
+    if is_fsdp_model(model) and not getattr(model, "_vgm_replicated_trainable", False):
         return model.clip_grad_norm_(max_norm)
     return torch.nn.utils.clip_grad_norm_(
         [param for param in model.parameters() if param.requires_grad],
@@ -1465,6 +1488,8 @@ def train(args: argparse.Namespace) -> None:
                 step_loss += float(loss_out.loss.detach().cpu().item()) / accum_steps
                 reward_margin += float(loss_out.reward_margin.detach().cpu().item()) / accum_steps
 
+            sync_replicated_trainable_gradients(transformer, dist_state)
+            record_memory(f"step_{step + 1:06d}_gradients_synchronized")
             grad_norm = clip_grad_norm(transformer, float(cfg["gradient_clip_val"]))
             grad_value = float(grad_norm.item() if hasattr(grad_norm, "item") else grad_norm)
             grad_nonzero = grad_nonzero or grad_value > 0
