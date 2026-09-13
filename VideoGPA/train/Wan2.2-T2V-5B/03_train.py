@@ -98,6 +98,7 @@ DEFAULT_CONFIG = {
     "reference_mode": "separate",
     "timestep_mode": "legacy_unshifted_model_input",
     "distributed_strategy": "ddp",
+    "backward_mode": "joint",
 }
 
 
@@ -239,6 +240,7 @@ def resolve_config(args: argparse.Namespace) -> dict[str, Any]:
             "distributed_strategy": yaml_train.get(
                 "distributed_strategy", train_cfg["distributed_strategy"]
             ),
+            "backward_mode": yaml_train.get("backward_mode", train_cfg["backward_mode"]),
         }
     )
     if "num_train_timesteps" not in yaml_train and hasattr(wan_cfg, "num_train_timesteps"):
@@ -271,6 +273,8 @@ def resolve_config(args: argparse.Namespace) -> dict[str, Any]:
         train_cfg["shift"] = args.training_shift
     if args.distributed_strategy is not None:
         train_cfg["distributed_strategy"] = args.distributed_strategy
+    if args.backward_mode is not None:
+        train_cfg["backward_mode"] = args.backward_mode
     if train_cfg["expert_mode"] not in {"both", "high", "low"}:
         raise ValueError(f"Unsupported expert_mode={train_cfg['expert_mode']!r}")
     if train_cfg["reference_mode"] not in {"separate", "shared_base"}:
@@ -279,6 +283,10 @@ def resolve_config(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"Unsupported timestep_mode={train_cfg['timestep_mode']!r}")
     if train_cfg["distributed_strategy"] not in {"ddp", "fsdp_full_shard"}:
         raise ValueError(f"Unsupported distributed_strategy={train_cfg['distributed_strategy']!r}")
+    if train_cfg["backward_mode"] not in {"joint", "sequential_recompute"}:
+        raise ValueError(f"Unsupported backward_mode={train_cfg['backward_mode']!r}")
+    if train_cfg["backward_mode"] == "sequential_recompute" and float(train_cfg["lora_dropout"]) != 0.0:
+        raise ValueError("sequential_recompute requires lora_dropout=0 for deterministic recomputation")
     if architecture != "dual_expert_a14b" and train_cfg["expert_mode"] != "both":
         raise ValueError("expert_mode=high/low is only valid for dual_expert_a14b")
     cfg["training_resolved"] = train_cfg
@@ -950,6 +958,7 @@ def shared_step(
     cfg: dict[str, Any],
     device: torch.device,
     memory_callback: Any | None = None,
+    backward_scale: float | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     x_win = batch["x_win"].to(device=device, dtype=torch.bfloat16)
     x_lose = batch["x_lose"].to(device=device, dtype=torch.bfloat16)
@@ -1020,24 +1029,74 @@ def shared_step(
             v_lose_ref = torch.stack(ref_transformer(x_lose_input, **common_kwargs))
             if memory_callback is not None:
                 memory_callback("reference_loser_complete")
-    with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-        v_win_pred = torch.stack(transformer(x_win_input, **common_kwargs))
-        if memory_callback is not None:
-            memory_callback("policy_winner_complete")
-        v_lose_pred = torch.stack(transformer(x_lose_input, **common_kwargs))
-        if memory_callback is not None:
-            memory_callback("policy_loser_complete")
-
     v_win_target = flow_matching_get_velocity(x_win.float(), noise.float())
     v_lose_target = flow_matching_get_velocity(x_lose.float(), noise.float())
-    loss_out = loss_fn(
-        v_win_pred.float(),
-        v_lose_pred.float(),
-        v_win_ref.float(),
-        v_lose_ref.float(),
-        v_win_target,
-        v_lose_target,
-    )
+    backward_performed = False
+    if cfg.get("backward_mode") == "sequential_recompute":
+        if backward_scale is None:
+            raise ValueError("sequential_recompute requires backward_scale")
+        with torch.no_grad(), torch.amp.autocast(
+            "cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"
+        ):
+            v_win_pred = torch.stack(transformer(x_win_input, **common_kwargs))
+            if memory_callback is not None:
+                memory_callback("policy_winner_score_complete")
+            v_lose_pred = torch.stack(transformer(x_lose_input, **common_kwargs))
+            if memory_callback is not None:
+                memory_callback("policy_loser_score_complete")
+
+        v_win_leaf = v_win_pred.detach().float().requires_grad_(True)
+        v_lose_leaf = v_lose_pred.detach().float().requires_grad_(True)
+        loss_out = loss_fn(
+            v_win_leaf,
+            v_lose_leaf,
+            v_win_ref.float(),
+            v_lose_ref.float(),
+            v_win_target,
+            v_lose_target,
+        )
+        grad_win, grad_lose = torch.autograd.grad(loss_out.loss, (v_win_leaf, v_lose_leaf))
+
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            v_win_recomputed = torch.stack(transformer(x_win_input, **common_kwargs))
+            winner_recompute_max_abs_diff = (
+                v_win_recomputed.detach().float() - v_win_pred.float()
+            ).abs().max().item()
+            win_surrogate = (v_win_recomputed.float() * grad_win).sum() * backward_scale
+        win_surrogate.backward()
+        del v_win_recomputed, win_surrogate
+        if memory_callback is not None:
+            memory_callback("policy_winner_backward_complete")
+
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            v_lose_recomputed = torch.stack(transformer(x_lose_input, **common_kwargs))
+            loser_recompute_max_abs_diff = (
+                v_lose_recomputed.detach().float() - v_lose_pred.float()
+            ).abs().max().item()
+            lose_surrogate = (v_lose_recomputed.float() * grad_lose).sum() * backward_scale
+        lose_surrogate.backward()
+        del v_lose_recomputed, lose_surrogate
+        if memory_callback is not None:
+            memory_callback("policy_loser_backward_complete")
+        backward_performed = True
+    else:
+        winner_recompute_max_abs_diff = None
+        loser_recompute_max_abs_diff = None
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            v_win_pred = torch.stack(transformer(x_win_input, **common_kwargs))
+            if memory_callback is not None:
+                memory_callback("policy_winner_complete")
+            v_lose_pred = torch.stack(transformer(x_lose_input, **common_kwargs))
+            if memory_callback is not None:
+                memory_callback("policy_loser_complete")
+        loss_out = loss_fn(
+            v_win_pred.float(),
+            v_lose_pred.float(),
+            v_win_ref.float(),
+            v_lose_ref.float(),
+            v_win_target,
+            v_lose_target,
+        )
     loss_metrics: dict[str, float] = {}
     for key, value in (loss_out.metrics or {}).items():
         if isinstance(value, torch.Tensor):
@@ -1074,6 +1133,9 @@ def shared_step(
         "timestep_mode": cfg.get("timestep_mode"),
         "loss_strategy": cfg.get("loss_strategy", "dpo"),
         "loss_metrics": loss_metrics,
+        "backward_performed": backward_performed,
+        "winner_recompute_max_abs_diff": winner_recompute_max_abs_diff,
+        "loser_recompute_max_abs_diff": loser_recompute_max_abs_diff,
     }
     if image_latent_shape is not None:
         debug["image_latent_shape"] = image_latent_shape
@@ -1266,6 +1328,7 @@ def train(args: argparse.Namespace) -> None:
         log(f"  task={cfg['task']}")
         log(f"  architecture={cfg['architecture']}")
         log(f"  distributed_strategy={cfg['distributed_strategy']}")
+        log(f"  backward_mode={cfg['backward_mode']}")
         log(f"  wan_task_key={cfg['wan_task_key']}")
         log(f"  image-conditioned branch={cfg['task'] == 'i2v'}")
         log(f"  dual_expert={is_dual_expert(cfg)}")
@@ -1481,10 +1544,12 @@ def train(args: argparse.Namespace) -> None:
                         cfg,
                         device,
                         memory_callback=record_memory if args.memory_probe else None,
+                        backward_scale=(1.0 / accum_steps),
                     )
                     if not torch.isfinite(loss_out.loss).item():
                         raise RuntimeError(f"Non-finite DPO loss at step {step + 1}, microbatch {micro_idx + 1}")
-                    (loss_out.loss / accum_steps).backward()
+                    if not debug["backward_performed"]:
+                        (loss_out.loss / accum_steps).backward()
                 step_loss += float(loss_out.loss.detach().cpu().item()) / accum_steps
                 reward_margin += float(loss_out.reward_margin.detach().cpu().item()) / accum_steps
 
@@ -1631,6 +1696,7 @@ def train(args: argparse.Namespace) -> None:
                 "expert_mode": cfg["expert_mode"],
                 "reference_mode": cfg["reference_mode"],
                 "distributed_strategy": cfg["distributed_strategy"],
+                "backward_mode": cfg["backward_mode"],
                 "timestep_mode": cfg["timestep_mode"],
                 "training_shift": cfg["shift"],
                 "memory_trace": str(memory_trace_path) if args.memory_probe else None,
@@ -1680,6 +1746,11 @@ def main() -> None:
     parser.add_argument(
         "--distributed-strategy",
         choices=("ddp", "fsdp_full_shard"),
+        default=None,
+    )
+    parser.add_argument(
+        "--backward-mode",
+        choices=("joint", "sequential_recompute"),
         default=None,
     )
     parser.add_argument(

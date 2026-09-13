@@ -56,6 +56,7 @@ def main() -> None:
         "distributed_strategy: "
         f"{training.get('distributed_strategy', probe_config.get('DISTRIBUTED_STRATEGY', 'unknown'))}"
     )
+    print(f"backward_mode: {training.get('backward_mode', probe_config.get('BACKWARD_MODE', 'unknown'))}")
     print("rank memory:")
 
     minimum_headroom = float("inf")
@@ -88,6 +89,8 @@ def main() -> None:
         )
         print(f"first_step_grad_norm: {first.get('grad_norm')}")
         print(f"first_step_time_sec: {first.get('step_time_sec')}")
+        print(f"first_step_winner_recompute_max_abs_diff: {debug.get('winner_recompute_max_abs_diff')}")
+        print(f"first_step_loser_recompute_max_abs_diff: {debug.get('loser_recompute_max_abs_diff')}")
 
     if not training:
         verdict = "FAILED_OR_INCOMPLETE: inspect logs/gate.log and the last memory trace label"

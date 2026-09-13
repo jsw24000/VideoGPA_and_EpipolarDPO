@@ -17,6 +17,7 @@ def test_trainer_exposes_memory_safe_a14b_gate_modes() -> None:
     assert '"--timestep-mode"' in source
     assert '"--training-shift"' in source
     assert '"--distributed-strategy"' in source
+    assert '"--backward-mode"' in source
     assert "wrap_fsdp_full_shard" in source
     assert "ShardingStrategy.FULL_SHARD" in source
     assert "transformer_layer_cls={WanAttentionBlock}" in source
@@ -26,6 +27,12 @@ def test_trainer_exposes_memory_safe_a14b_gate_modes() -> None:
     assert "param.data = param.data.to(device=device)" in source
     assert "sync_replicated_trainable_gradients(transformer, dist_state)" in source
     assert "dist.all_reduce(param.grad" in source
+    assert 'memory_callback("policy_winner_backward_complete")' in source
+    assert 'memory_callback("policy_loser_backward_complete")' in source
+    assert "torch.autograd.grad(loss_out.loss" in source
+    assert "if not debug[\"backward_performed\"]" in source
+    assert "winner_recompute_max_abs_diff" in source
+    assert "loser_recompute_max_abs_diff" in source
     assert "with shared_base_reference(transformer)" in source
     assert 'mode == "high"' in source
     assert 'mode == "low"' in source
@@ -43,6 +50,7 @@ def test_memory_gate_isolated_output_and_formal_latents() -> None:
     assert "expandable_segments:True" in source
     assert "DISTRIBUTED_STRATEGY" in source
     assert "--skip-checkpoint" in source
+    assert "BACKWARD_MODE" in source
 
 
 def test_memory_gate_summarizer_reports_headroom_and_reference_difference() -> None:
