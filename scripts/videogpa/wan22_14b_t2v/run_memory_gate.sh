@@ -13,6 +13,8 @@ EXPERT_MODE="${EXPERT_MODE:-high}"
 REFERENCE_MODE="${REFERENCE_MODE:-shared_base}"
 GATE_STEPS="${GATE_STEPS:-1}"
 TRAINING_SHIFT="${TRAINING_SHIFT:-5.0}"
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export PYTORCH_CUDA_ALLOC_CONF
 PROBE_ID="${PROBE_ID:-$(date +%Y%m%d_%H%M%S)_${EXPERT_MODE}_${REFERENCE_MODE}_${GATE_STEPS}step}"
 PROBE_DIR="${PROBE_DIR:-${VGM_OUTPUT_ROOT}/videogpa/wan22_14b_t2v/probes/${PROBE_ID}}"
 
@@ -71,6 +73,7 @@ TRAIN_ARGS=(
   printf 'GATE_STEPS=%s\n' "${GATE_STEPS}"
   printf 'TIMESTEP_MODE=shifted_scheduler\n'
   printf 'TRAINING_SHIFT=%s\n' "${TRAINING_SHIFT}"
+  printf 'PYTORCH_CUDA_ALLOC_CONF=%s\n' "${PYTORCH_CUDA_ALLOC_CONF}"
 } | tee "${PROBE_DIR}/probe_config.txt"
 
 IFS=',' read -r -a GPU_LIST <<< "${GPU_IDS}"

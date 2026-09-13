@@ -859,6 +859,7 @@ def shared_step(
     batch: dict[str, Any],
     cfg: dict[str, Any],
     device: torch.device,
+    memory_callback: Any | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     x_win = batch["x_win"].to(device=device, dtype=torch.bfloat16)
     x_lose = batch["x_lose"].to(device=device, dtype=torch.bfloat16)
@@ -916,14 +917,26 @@ def shared_step(
         with shared_base_reference(transformer) as reference_model:
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 v_win_ref = torch.stack(reference_model(x_win_input, **common_kwargs))
+                if memory_callback is not None:
+                    memory_callback("reference_winner_complete")
                 v_lose_ref = torch.stack(reference_model(x_lose_input, **common_kwargs))
+                if memory_callback is not None:
+                    memory_callback("reference_loser_complete")
     else:
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             v_win_ref = torch.stack(ref_transformer(x_win_input, **common_kwargs))
+            if memory_callback is not None:
+                memory_callback("reference_winner_complete")
             v_lose_ref = torch.stack(ref_transformer(x_lose_input, **common_kwargs))
+            if memory_callback is not None:
+                memory_callback("reference_loser_complete")
     with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
         v_win_pred = torch.stack(transformer(x_win_input, **common_kwargs))
+        if memory_callback is not None:
+            memory_callback("policy_winner_complete")
         v_lose_pred = torch.stack(transformer(x_lose_input, **common_kwargs))
+        if memory_callback is not None:
+            memory_callback("policy_loser_complete")
 
     v_win_target = flow_matching_get_velocity(x_win.float(), noise.float())
     v_lose_target = flow_matching_get_velocity(x_lose.float(), noise.float())
@@ -1349,7 +1362,15 @@ def train(args: argparse.Namespace) -> None:
                     else nullcontext()
                 )
                 with sync_context:
-                    loss_out, debug = shared_step(transformer, ref_transformer, loss_fn, batch, cfg, device)
+                    loss_out, debug = shared_step(
+                        transformer,
+                        ref_transformer,
+                        loss_fn,
+                        batch,
+                        cfg,
+                        device,
+                        memory_callback=record_memory if args.memory_probe else None,
+                    )
                     if not torch.isfinite(loss_out.loss).item():
                         raise RuntimeError(f"Non-finite DPO loss at step {step + 1}, microbatch {micro_idx + 1}")
                     (loss_out.loss / accum_steps).backward()

@@ -30,6 +30,7 @@ def test_memory_gate_isolated_output_and_formal_latents() -> None:
     assert '--memory-probe' in source
     assert '--timestep-mode shifted_scheduler' in source
     assert '--training-shift "${TRAINING_SHIFT}"' in source
+    assert "expandable_segments:True" in source
 
 
 def test_memory_gate_summarizer_reports_headroom_and_reference_difference() -> None:
