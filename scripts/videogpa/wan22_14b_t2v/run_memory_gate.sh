@@ -13,6 +13,7 @@ EXPERT_MODE="${EXPERT_MODE:-high}"
 REFERENCE_MODE="${REFERENCE_MODE:-shared_base}"
 GATE_STEPS="${GATE_STEPS:-1}"
 TRAINING_SHIFT="${TRAINING_SHIFT:-5.0}"
+DISTRIBUTED_STRATEGY="${DISTRIBUTED_STRATEGY:-ddp}"
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export PYTORCH_CUDA_ALLOC_CONF
 PROBE_ID="${PROBE_ID:-$(date +%Y%m%d_%H%M%S)_${EXPERT_MODE}_${REFERENCE_MODE}_${GATE_STEPS}step}"
@@ -25,6 +26,10 @@ esac
 case "${REFERENCE_MODE}" in
   shared_base|separate) ;;
   *) printf 'REFERENCE_MODE must be shared_base or separate; got %s\n' "${REFERENCE_MODE}" >&2; exit 2 ;;
+esac
+case "${DISTRIBUTED_STRATEGY}" in
+  ddp|fsdp_full_shard) ;;
+  *) printf 'DISTRIBUTED_STRATEGY must be ddp or fsdp_full_shard; got %s\n' "${DISTRIBUTED_STRATEGY}" >&2; exit 2 ;;
 esac
 if ! [[ "${GATE_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
   printf 'GATE_STEPS must be a positive integer; got %s\n' "${GATE_STEPS}" >&2
@@ -63,6 +68,11 @@ TRAIN_ARGS=(
   --warmup_steps 0
   --memory-probe
 )
+if [[ "${DISTRIBUTED_STRATEGY}" == "fsdp_full_shard" ]]; then
+  TRAIN_ARGS+=(--distributed-strategy fsdp_full_shard --skip-checkpoint)
+else
+  TRAIN_ARGS+=(--distributed-strategy ddp)
+fi
 
 {
   printf 'RUN_DIR=%s\n' "${RUN_DIR}"
@@ -73,10 +83,15 @@ TRAIN_ARGS=(
   printf 'GATE_STEPS=%s\n' "${GATE_STEPS}"
   printf 'TIMESTEP_MODE=shifted_scheduler\n'
   printf 'TRAINING_SHIFT=%s\n' "${TRAINING_SHIFT}"
+  printf 'DISTRIBUTED_STRATEGY=%s\n' "${DISTRIBUTED_STRATEGY}"
   printf 'PYTORCH_CUDA_ALLOC_CONF=%s\n' "${PYTORCH_CUDA_ALLOC_CONF}"
 } | tee "${PROBE_DIR}/probe_config.txt"
 
 IFS=',' read -r -a GPU_LIST <<< "${GPU_IDS}"
+if [[ "${DISTRIBUTED_STRATEGY}" == "fsdp_full_shard" ]] && (( ${#GPU_LIST[@]} < 2 )); then
+  printf 'fsdp_full_shard requires at least two GPU_IDS\n' >&2
+  exit 2
+fi
 if (( ${#GPU_LIST[@]} > 1 )); then
   CUDA_VISIBLE_DEVICES="${GPU_IDS}" "${PY_CMD[@]}" -m torch.distributed.run \
     --standalone \

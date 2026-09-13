@@ -21,6 +21,18 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def read_probe_config(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.is_file():
+        return values
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            key, separator, value = line.rstrip("\n").partition("=")
+            if separator:
+                values[key] = value
+    return values
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Summarize a WAN2.2 A14B memory gate")
     parser.add_argument("probe_dir")
@@ -33,12 +45,17 @@ def main() -> None:
 
     summary_path = probe_dir / "reports" / "training_summary.json"
     training = read_json(summary_path) if summary_path.is_file() else {}
+    probe_config = read_probe_config(probe_dir / "probe_config.txt")
     print(f"probe_dir: {probe_dir}")
     print(f"status: {training.get('status', 'INCOMPLETE_OR_FAILED')}")
-    print(f"expert_mode: {training.get('expert_mode', 'unknown')}")
-    print(f"reference_mode: {training.get('reference_mode', 'unknown')}")
-    print(f"timestep_mode: {training.get('timestep_mode', 'unknown')}")
-    print(f"training_shift: {training.get('training_shift', 'unknown')}")
+    print(f"expert_mode: {training.get('expert_mode', probe_config.get('EXPERT_MODE', 'unknown'))}")
+    print(f"reference_mode: {training.get('reference_mode', probe_config.get('REFERENCE_MODE', 'unknown'))}")
+    print(f"timestep_mode: {training.get('timestep_mode', probe_config.get('TIMESTEP_MODE', 'unknown'))}")
+    print(f"training_shift: {training.get('training_shift', probe_config.get('TRAINING_SHIFT', 'unknown'))}")
+    print(
+        "distributed_strategy: "
+        f"{training.get('distributed_strategy', probe_config.get('DISTRIBUTED_STRATEGY', 'unknown'))}"
+    )
     print("rank memory:")
 
     minimum_headroom = float("inf")
@@ -56,7 +73,8 @@ def main() -> None:
         maximum_reserved = max(maximum_reserved, peak_reserved)
         print(
             f"  rank={rank} peak_allocated={peak_allocated:.2f}GB "
-            f"peak_reserved={peak_reserved:.2f}GB total={total:.2f}GB headroom={headroom:.2f}GB"
+            f"peak_reserved={peak_reserved:.2f}GB total={total:.2f}GB headroom={headroom:.2f}GB "
+            f"last_label={rows[-1].get('label', 'unknown')}"
         )
 
     metrics = training.get("metrics", [])

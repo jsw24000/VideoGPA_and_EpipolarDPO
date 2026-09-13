@@ -17,6 +17,7 @@ import random
 import sys
 import time
 from contextlib import ExitStack, contextmanager, nullcontext
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -58,7 +59,7 @@ from resume_utils import (  # noqa: E402
     validate_resume_config,
     validate_resume_metadata,
 )
-from wan.modules.model import WanModel  # noqa: E402
+from wan.modules.model import WanAttentionBlock, WanModel  # noqa: E402
 from wan.configs import WAN_CONFIGS  # noqa: E402
 
 
@@ -96,6 +97,7 @@ DEFAULT_CONFIG = {
     "expert_mode": "both",
     "reference_mode": "separate",
     "timestep_mode": "legacy_unshifted_model_input",
+    "distributed_strategy": "ddp",
 }
 
 
@@ -234,6 +236,9 @@ def resolve_config(args: argparse.Namespace) -> dict[str, Any]:
             "expert_mode": yaml_train.get("expert_mode", train_cfg["expert_mode"]),
             "reference_mode": yaml_train.get("reference_mode", train_cfg["reference_mode"]),
             "timestep_mode": yaml_train.get("timestep_mode", train_cfg["timestep_mode"]),
+            "distributed_strategy": yaml_train.get(
+                "distributed_strategy", train_cfg["distributed_strategy"]
+            ),
         }
     )
     if "num_train_timesteps" not in yaml_train and hasattr(wan_cfg, "num_train_timesteps"):
@@ -264,12 +269,16 @@ def resolve_config(args: argparse.Namespace) -> dict[str, Any]:
         train_cfg["timestep_mode"] = args.timestep_mode
     if args.training_shift is not None:
         train_cfg["shift"] = args.training_shift
+    if args.distributed_strategy is not None:
+        train_cfg["distributed_strategy"] = args.distributed_strategy
     if train_cfg["expert_mode"] not in {"both", "high", "low"}:
         raise ValueError(f"Unsupported expert_mode={train_cfg['expert_mode']!r}")
     if train_cfg["reference_mode"] not in {"separate", "shared_base"}:
         raise ValueError(f"Unsupported reference_mode={train_cfg['reference_mode']!r}")
     if train_cfg["timestep_mode"] not in {"legacy_unshifted_model_input", "shifted_scheduler"}:
         raise ValueError(f"Unsupported timestep_mode={train_cfg['timestep_mode']!r}")
+    if train_cfg["distributed_strategy"] not in {"ddp", "fsdp_full_shard"}:
+        raise ValueError(f"Unsupported distributed_strategy={train_cfg['distributed_strategy']!r}")
     if architecture != "dual_expert_a14b" and train_cfg["expert_mode"] != "both":
         raise ValueError("expert_mode=high/low is only valid for dual_expert_a14b")
     cfg["training_resolved"] = train_cfg
@@ -347,7 +356,25 @@ def distributed_barrier(state: dict[str, int | bool]) -> None:
 
 
 def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
-    return model.module if isinstance(model, DistributedDataParallel) else model
+    if isinstance(model, DistributedDataParallel):
+        return model.module
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel
+
+        if isinstance(model, FullyShardedDataParallel):
+            return model.module
+    except ImportError:
+        pass
+    return model
+
+
+def is_fsdp_model(model: torch.nn.Module) -> bool:
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel
+
+        return isinstance(model, FullyShardedDataParallel)
+    except ImportError:
+        return False
 
 
 def get_sigma_from_timestep(timestep: torch.Tensor, num_train_timesteps: int = 1000, shift: float = 5.0) -> torch.Tensor:
@@ -437,7 +464,8 @@ def shared_base_reference(model: torch.nn.Module):
                 if disable_adapter is None:
                     raise RuntimeError("reference_mode=shared_base requires PEFT disable_adapter() support")
                 stack.enter_context(disable_adapter())
-            yield base
+            # FSDP's root forward hooks must run to all-gather block parameters.
+            yield model if is_fsdp_model(model) else base
     finally:
         base.train(was_training)
 
@@ -554,6 +582,45 @@ def enable_gradient_checkpointing(model: torch.nn.Module) -> None:
             return ckpt_forward
 
         block.forward = make_forward(original_forward)
+
+
+def wrap_fsdp_full_shard(model: torch.nn.Module, device: torch.device) -> torch.nn.Module:
+    from torch.distributed.fsdp import (
+        BackwardPrefetch,
+        FullyShardedDataParallel,
+        MixedPrecision,
+        ShardingStrategy,
+    )
+    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
+    auto_wrap = partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={WanAttentionBlock},
+    )
+    return FullyShardedDataParallel(
+        model,
+        auto_wrap_policy=auto_wrap,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        mixed_precision=MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            buffer_dtype=torch.bfloat16,
+        ),
+        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+        device_id=device,
+        sync_module_states=False,
+        limit_all_gathers=True,
+        use_orig_params=True,
+    )
+
+
+def clip_grad_norm(model: torch.nn.Module, max_norm: float) -> torch.Tensor:
+    if is_fsdp_model(model):
+        return model.clip_grad_norm_(max_norm)
+    return torch.nn.utils.clip_grad_norm_(
+        [param for param in model.parameters() if param.requires_grad],
+        max_norm=max_norm,
+    )
 
 
 def trainable_stats(model: torch.nn.Module) -> dict[str, Any]:
@@ -1143,6 +1210,8 @@ def train(args: argparse.Namespace) -> None:
     try:
         cfg_all = resolve_config(args)
         cfg = cfg_all["training_resolved"]
+        if args.skip_checkpoint and not args.memory_probe:
+            raise ValueError("--skip-checkpoint is only valid with --memory-probe")
         if dist_state["distributed"]:
             cfg["device"] = int(dist_state["local_rank"])
         run_dir = Path(cfg_all["paths"]["run_dir"]).resolve()
@@ -1173,6 +1242,7 @@ def train(args: argparse.Namespace) -> None:
         log("Training mode:")
         log(f"  task={cfg['task']}")
         log(f"  architecture={cfg['architecture']}")
+        log(f"  distributed_strategy={cfg['distributed_strategy']}")
         log(f"  wan_task_key={cfg['wan_task_key']}")
         log(f"  image-conditioned branch={cfg['task'] == 'i2v'}")
         log(f"  dual_expert={is_dual_expert(cfg)}")
@@ -1244,7 +1314,19 @@ def train(args: argparse.Namespace) -> None:
             lora_dropout=float(cfg["lora_dropout"]),
             target_modules=list(cfg["lora_target_modules"]),
         )
-        transformer = build_policy_model(model_path, cfg, lora_config, device)
+        use_fsdp = cfg["distributed_strategy"] == "fsdp_full_shard"
+        if use_fsdp:
+            if not dist_state["distributed"]:
+                raise ValueError("fsdp_full_shard requires torchrun with world_size > 1")
+            if not args.memory_probe or not args.skip_checkpoint:
+                raise ValueError(
+                    "fsdp_full_shard is currently gated to --memory-probe --skip-checkpoint; "
+                    "formal checkpoint/resume support must be validated before training"
+                )
+            if resume_checkpoint is not None:
+                raise ValueError("FSDP memory gate does not accept resume checkpoints")
+        load_device = torch.device("cpu") if use_fsdp else device
+        transformer = build_policy_model(model_path, cfg, lora_config, load_device)
         record_memory("policy_loaded")
         if cfg.get("enable_gradient_checkpointing"):
             enable_model_gradient_checkpointing(transformer)
@@ -1265,10 +1347,10 @@ def train(args: argparse.Namespace) -> None:
         if not stats["trainable_parameter_names"] or not all("lora_" in name for name in stats["trainable_parameter_names"]):
             raise RuntimeError("Expected only LoRA parameters to be trainable")
 
-        lora_before = clone_trainable(transformer)
-        frozen_before = sample_frozen(transformer)
-
-        if dist_state["distributed"]:
+        if use_fsdp:
+            transformer = wrap_fsdp_full_shard(transformer, device)
+            record_memory("policy_fsdp_wrapped")
+        elif dist_state["distributed"]:
             find_unused_default = "1" if is_dual_expert(cfg) and cfg["expert_mode"] == "both" else "0"
             find_unused = os.environ.get("DDP_FIND_UNUSED_PARAMETERS", find_unused_default) == "1"
             transformer = DistributedDataParallel(
@@ -1277,6 +1359,9 @@ def train(args: argparse.Namespace) -> None:
                 output_device=int(dist_state["local_rank"]) if device.type == "cuda" else None,
                 find_unused_parameters=find_unused,
             )
+
+        lora_before = clone_trainable(transformer)
+        frozen_before = sample_frozen(transformer)
 
         if cfg["reference_mode"] == "shared_base":
             log("Using policy base weights with adapters disabled as the frozen reference")
@@ -1307,7 +1392,10 @@ def train(args: argparse.Namespace) -> None:
                 "requires_grad": False,
             }
 
-        ref_before = sample_frozen(ref_transformer if ref_transformer is not None else unwrap_model(transformer))
+        reference_audit_model = ref_transformer if ref_transformer is not None else (
+            transformer if use_fsdp else unwrap_model(transformer)
+        )
+        ref_before = sample_frozen(reference_audit_model)
         metrics = []
         grad_nonzero = False
         accum_steps = max(1, int(cfg["accumulate_grad_batches"]))
@@ -1377,10 +1465,7 @@ def train(args: argparse.Namespace) -> None:
                 step_loss += float(loss_out.loss.detach().cpu().item()) / accum_steps
                 reward_margin += float(loss_out.reward_margin.detach().cpu().item()) / accum_steps
 
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                [p for p in transformer.parameters() if p.requires_grad],
-                max_norm=float(cfg["gradient_clip_val"]),
-            )
+            grad_norm = clip_grad_norm(transformer, float(cfg["gradient_clip_val"]))
             grad_value = float(grad_norm.item() if hasattr(grad_norm, "item") else grad_norm)
             grad_nonzero = grad_nonzero or grad_value > 0
             optimizer.step()
@@ -1414,7 +1499,9 @@ def train(args: argparse.Namespace) -> None:
             if is_main:
                 metrics.append(row)
                 print(json.dumps(row, ensure_ascii=False))
-            should_save = step % int(cfg["save_steps"]) == 0 or step == int(cfg["max_steps"])
+            should_save = not args.skip_checkpoint and (
+                step % int(cfg["save_steps"]) == 0 or step == int(cfg["max_steps"])
+            )
             if should_save:
                 checkpoint_path = checkpoint_root / f"step_{step:06d}"
                 ensure_checkpoint_save_target_safe(checkpoint_path)
@@ -1446,18 +1533,18 @@ def train(args: argparse.Namespace) -> None:
             dist.all_reduce(flag, op=dist.ReduceOp.MAX)
             grad_nonzero = bool(flag.item())
 
-        final_ckpt = checkpoint_root / f"step_{step:06d}"
-        policy_model = unwrap_model(transformer)
-        lora_delta = trainable_delta(lora_before, policy_model)
-        base_changed = frozen_param_changed(policy_model, frozen_before)
+        final_ckpt = None if args.skip_checkpoint else checkpoint_root / f"step_{step:06d}"
+        audit_model = transformer if use_fsdp else unwrap_model(transformer)
+        lora_delta = trainable_delta(lora_before, audit_model)
+        base_changed = frozen_param_changed(audit_model, frozen_before)
         ref_changed = frozen_param_changed(
-            ref_transformer if ref_transformer is not None else policy_model,
+            ref_transformer if ref_transformer is not None else audit_model,
             ref_before,
         )
         lora_changed = lora_delta > 0
         adapter_layout_ok = True
         adapter_layout_error = ""
-        if is_main:
+        if is_main and final_ckpt is not None:
             try:
                 assert_checkpoint_adapter_layout(final_ckpt, cfg)
             except Exception as exc:
@@ -1503,8 +1590,9 @@ def train(args: argparse.Namespace) -> None:
             torch.cuda.empty_cache()
 
         if is_main:
-            print(f"Reloading checkpoint adapter from {final_ckpt}")
-            reload_checkpoint_smoke(model_path, final_ckpt, cfg)
+            if final_ckpt is not None:
+                print(f"Reloading checkpoint adapter from {final_ckpt}")
+                reload_checkpoint_smoke(model_path, final_ckpt, cfg)
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
@@ -1517,6 +1605,7 @@ def train(args: argparse.Namespace) -> None:
                 "dual_expert": is_dual_expert(cfg),
                 "expert_mode": cfg["expert_mode"],
                 "reference_mode": cfg["reference_mode"],
+                "distributed_strategy": cfg["distributed_strategy"],
                 "timestep_mode": cfg["timestep_mode"],
                 "training_shift": cfg["shift"],
                 "memory_trace": str(memory_trace_path) if args.memory_probe else None,
@@ -1525,8 +1614,8 @@ def train(args: argparse.Namespace) -> None:
                 "effective_global_pair_batch": effective_batch,
                 "effective_global_batch_size": effective_batch,
                 "steps": step,
-                "checkpoint_path": str(final_ckpt),
-                "checkpoint_reloaded": True,
+                "checkpoint_path": str(final_ckpt) if final_ckpt is not None else None,
+                "checkpoint_reloaded": final_ckpt is not None,
                 "lora_delta_l1": lora_delta,
                 "grad_nonzero": grad_nonzero,
                 "base_parameters_changed": base_changed,
@@ -1536,7 +1625,10 @@ def train(args: argparse.Namespace) -> None:
             }
             write_json(output_dir / "reports/training_summary.json", summary)
             write_resolved_config(output_dir, cfg_all)
-            print(f"Training PASS. Checkpoint: {final_ckpt}")
+            if final_ckpt is None:
+                print("FSDP memory gate PASS. No checkpoint was written.")
+            else:
+                print(f"Training PASS. Checkpoint: {final_ckpt}")
         distributed_barrier(dist_state)
     finally:
         cleanup_distributed(dist_state)
@@ -1560,6 +1652,16 @@ def main() -> None:
         default=None,
     )
     parser.add_argument("--training-shift", type=float, default=None)
+    parser.add_argument(
+        "--distributed-strategy",
+        choices=("ddp", "fsdp_full_shard"),
+        default=None,
+    )
+    parser.add_argument(
+        "--skip-checkpoint",
+        action="store_true",
+        help="Probe-only mode: run optimizer steps without writing a resumable checkpoint",
+    )
     parser.add_argument(
         "--memory-probe",
         action="store_true",

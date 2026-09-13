@@ -16,6 +16,12 @@ def test_trainer_exposes_memory_safe_a14b_gate_modes() -> None:
     assert '"--memory-probe"' in source
     assert '"--timestep-mode"' in source
     assert '"--training-shift"' in source
+    assert '"--distributed-strategy"' in source
+    assert "wrap_fsdp_full_shard" in source
+    assert "ShardingStrategy.FULL_SHARD" in source
+    assert "transformer_layer_cls={WanAttentionBlock}" in source
+    assert "use_orig_params=True" in source
+    assert "model.clip_grad_norm_" in source
     assert "with shared_base_reference(transformer)" in source
     assert 'mode == "high"' in source
     assert 'mode == "low"' in source
@@ -31,6 +37,8 @@ def test_memory_gate_isolated_output_and_formal_latents() -> None:
     assert '--timestep-mode shifted_scheduler' in source
     assert '--training-shift "${TRAINING_SHIFT}"' in source
     assert "expandable_segments:True" in source
+    assert "DISTRIBUTED_STRATEGY" in source
+    assert "--skip-checkpoint" in source
 
 
 def test_memory_gate_summarizer_reports_headroom_and_reference_difference() -> None:
@@ -39,3 +47,5 @@ def test_memory_gate_summarizer_reports_headroom_and_reference_difference() -> N
     assert "headroom" in source
     assert "first_step_policy_reference_max_abs_diff" in source
     assert "first_step_model_timestep_range" in source
+    assert "read_probe_config" in source
+    assert "last_label=" in source
