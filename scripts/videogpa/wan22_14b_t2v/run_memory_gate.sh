@@ -15,6 +15,7 @@ GATE_STEPS="${GATE_STEPS:-1}"
 TRAINING_SHIFT="${TRAINING_SHIFT:-5.0}"
 DISTRIBUTED_STRATEGY="${DISTRIBUTED_STRATEGY:-ddp}"
 BACKWARD_MODE="${BACKWARD_MODE:-joint}"
+PAIR_SCORE_MODE="${PAIR_SCORE_MODE:-separate}"
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export PYTORCH_CUDA_ALLOC_CONF
 PROBE_ID="${PROBE_ID:-$(date +%Y%m%d_%H%M%S)_${EXPERT_MODE}_${REFERENCE_MODE}_${GATE_STEPS}step}"
@@ -35,6 +36,10 @@ esac
 case "${BACKWARD_MODE}" in
   joint|sequential_recompute) ;;
   *) printf 'BACKWARD_MODE must be joint or sequential_recompute; got %s\n' "${BACKWARD_MODE}" >&2; exit 2 ;;
+esac
+case "${PAIR_SCORE_MODE}" in
+  separate|stacked) ;;
+  *) printf 'PAIR_SCORE_MODE must be separate or stacked; got %s\n' "${PAIR_SCORE_MODE}" >&2; exit 2 ;;
 esac
 if ! [[ "${GATE_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
   printf 'GATE_STEPS must be a positive integer; got %s\n' "${GATE_STEPS}" >&2
@@ -73,6 +78,7 @@ TRAIN_ARGS=(
   --warmup_steps 0
   --memory-probe
   --backward-mode "${BACKWARD_MODE}"
+  --pair-score-mode "${PAIR_SCORE_MODE}"
 )
 if [[ "${DISTRIBUTED_STRATEGY}" == "fsdp_full_shard" ]]; then
   TRAIN_ARGS+=(--distributed-strategy fsdp_full_shard --skip-checkpoint)
@@ -91,6 +97,7 @@ fi
   printf 'TRAINING_SHIFT=%s\n' "${TRAINING_SHIFT}"
   printf 'DISTRIBUTED_STRATEGY=%s\n' "${DISTRIBUTED_STRATEGY}"
   printf 'BACKWARD_MODE=%s\n' "${BACKWARD_MODE}"
+  printf 'PAIR_SCORE_MODE=%s\n' "${PAIR_SCORE_MODE}"
   printf 'PYTORCH_CUDA_ALLOC_CONF=%s\n' "${PYTORCH_CUDA_ALLOC_CONF}"
 } | tee "${PROBE_DIR}/probe_config.txt"
 

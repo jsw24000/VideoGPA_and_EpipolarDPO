@@ -99,6 +99,7 @@ DEFAULT_CONFIG = {
     "timestep_mode": "legacy_unshifted_model_input",
     "distributed_strategy": "ddp",
     "backward_mode": "joint",
+    "pair_score_mode": "separate",
 }
 
 
@@ -241,6 +242,7 @@ def resolve_config(args: argparse.Namespace) -> dict[str, Any]:
                 "distributed_strategy", train_cfg["distributed_strategy"]
             ),
             "backward_mode": yaml_train.get("backward_mode", train_cfg["backward_mode"]),
+            "pair_score_mode": yaml_train.get("pair_score_mode", train_cfg["pair_score_mode"]),
         }
     )
     if "num_train_timesteps" not in yaml_train and hasattr(wan_cfg, "num_train_timesteps"):
@@ -275,6 +277,10 @@ def resolve_config(args: argparse.Namespace) -> dict[str, Any]:
         train_cfg["distributed_strategy"] = args.distributed_strategy
     if args.backward_mode is not None:
         train_cfg["backward_mode"] = args.backward_mode
+    if args.pair_score_mode is not None:
+        train_cfg["pair_score_mode"] = args.pair_score_mode
+    if args.save_steps is not None:
+        train_cfg["save_steps"] = args.save_steps
     if train_cfg["expert_mode"] not in {"both", "high", "low"}:
         raise ValueError(f"Unsupported expert_mode={train_cfg['expert_mode']!r}")
     if train_cfg["reference_mode"] not in {"separate", "shared_base"}:
@@ -285,6 +291,8 @@ def resolve_config(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"Unsupported distributed_strategy={train_cfg['distributed_strategy']!r}")
     if train_cfg["backward_mode"] not in {"joint", "sequential_recompute"}:
         raise ValueError(f"Unsupported backward_mode={train_cfg['backward_mode']!r}")
+    if train_cfg["pair_score_mode"] not in {"separate", "stacked"}:
+        raise ValueError(f"Unsupported pair_score_mode={train_cfg['pair_score_mode']!r}")
     if train_cfg["backward_mode"] == "sequential_recompute" and float(train_cfg["lora_dropout"]) != 0.0:
         raise ValueError("sequential_recompute requires lora_dropout=0 for deterministic recomputation")
     if architecture != "dual_expert_a14b" and train_cfg["expert_mode"] != "both":
@@ -915,7 +923,7 @@ def capture_rng_state() -> dict[str, Any]:
         "torch_cpu_rng_state": torch.get_rng_state(),
     }
     if torch.cuda.is_available():
-        state["torch_cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+        state["torch_cuda_rng_state"] = torch.cuda.get_rng_state()
     return state
 
 
@@ -929,6 +937,8 @@ def restore_rng_state_if_present(path: Path | None) -> dict[str, Any]:
         torch.set_rng_state(state["torch_cpu_rng_state"])
     if torch.cuda.is_available() and "torch_cuda_rng_state_all" in state:
         torch.cuda.set_rng_state_all(state["torch_cuda_rng_state_all"])
+    elif torch.cuda.is_available() and "torch_cuda_rng_state" in state:
+        torch.cuda.set_rng_state(state["torch_cuda_rng_state"])
     return {"restored": True, "path": str(path)}
 
 
@@ -1012,21 +1022,33 @@ def shared_step(
     if y_list is not None:
         common_kwargs["y"] = y_list
 
+    def no_grad_pair_forward(model: torch.nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
+        if cfg.get("pair_score_mode") == "separate":
+            return (
+                torch.stack(model(x_win_input, **common_kwargs)),
+                torch.stack(model(x_lose_input, **common_kwargs)),
+            )
+        pair_kwargs = dict(common_kwargs)
+        pair_kwargs["t"] = torch.cat([t_model, t_model], dim=0)
+        pair_kwargs["context"] = context_list + context_list
+        if y_list is not None:
+            pair_kwargs["y"] = y_list + y_list
+        pair_output = torch.stack(model(x_win_input + x_lose_input, **pair_kwargs))
+        return pair_output[:batch_size], pair_output[batch_size:]
+
     if ref_transformer is None:
         with shared_base_reference(transformer) as reference_model:
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                v_win_ref = torch.stack(reference_model(x_win_input, **common_kwargs))
+                v_win_ref, v_lose_ref = no_grad_pair_forward(reference_model)
                 if memory_callback is not None:
                     memory_callback("reference_winner_complete")
-                v_lose_ref = torch.stack(reference_model(x_lose_input, **common_kwargs))
                 if memory_callback is not None:
                     memory_callback("reference_loser_complete")
     else:
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            v_win_ref = torch.stack(ref_transformer(x_win_input, **common_kwargs))
+            v_win_ref, v_lose_ref = no_grad_pair_forward(ref_transformer)
             if memory_callback is not None:
                 memory_callback("reference_winner_complete")
-            v_lose_ref = torch.stack(ref_transformer(x_lose_input, **common_kwargs))
             if memory_callback is not None:
                 memory_callback("reference_loser_complete")
     v_win_target = flow_matching_get_velocity(x_win.float(), noise.float())
@@ -1038,10 +1060,9 @@ def shared_step(
         with torch.no_grad(), torch.amp.autocast(
             "cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"
         ):
-            v_win_pred = torch.stack(transformer(x_win_input, **common_kwargs))
+            v_win_pred, v_lose_pred = no_grad_pair_forward(transformer)
             if memory_callback is not None:
                 memory_callback("policy_winner_score_complete")
-            v_lose_pred = torch.stack(transformer(x_lose_input, **common_kwargs))
             if memory_callback is not None:
                 memory_callback("policy_loser_score_complete")
 
@@ -1134,6 +1155,7 @@ def shared_step(
         "loss_strategy": cfg.get("loss_strategy", "dpo"),
         "loss_metrics": loss_metrics,
         "backward_performed": backward_performed,
+        "pair_score_mode": cfg.get("pair_score_mode", "separate"),
         "winner_recompute_max_abs_diff": winner_recompute_max_abs_diff,
         "loser_recompute_max_abs_diff": loser_recompute_max_abs_diff,
     }
@@ -1166,14 +1188,39 @@ def load_lora_adapters_for_model(
     return load_lora_adapter_strict(model, Path(adapter_model))
 
 
+def clean_fsdp_parameter_name(name: str) -> str:
+    parts = [part for part in name.split(".") if part != "_fsdp_wrapped_module"]
+    return ".".join(parts)
+
+
+def fsdp_lora_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    state = {
+        clean_fsdp_parameter_name(name): param.detach().cpu().clone()
+        for name, param in model.named_parameters()
+        if param.requires_grad and "lora_" in name
+    }
+    if not state:
+        raise RuntimeError("FSDP checkpoint found no replicated LoRA parameters")
+    return state
+
+
 def save_model_adapters(model: torch.nn.Module, checkpoint_dir: Path, cfg: dict[str, Any]) -> None:
-    if isinstance(model, DualExpertModel):
-        model.low_noise_model.save_pretrained(checkpoint_dir / "low_noise_model")
-        model.high_noise_model.save_pretrained(checkpoint_dir / "high_noise_model")
+    fsdp_state = fsdp_lora_state_dict(model) if is_fsdp_model(model) else None
+    base = unwrap_model(model)
+    if isinstance(base, DualExpertModel):
+        base.low_noise_model.save_pretrained(checkpoint_dir / "low_noise_model")
+        base.high_noise_model.save_pretrained(checkpoint_dir / "high_noise_model")
     elif expert_checkpoint_name(cfg) is not None:
-        model.save_pretrained(checkpoint_dir / str(expert_checkpoint_name(cfg)))
+        target = checkpoint_dir / str(expert_checkpoint_name(cfg))
+        if fsdp_state is None:
+            base.save_pretrained(target)
+        else:
+            base.save_pretrained(target, state_dict=fsdp_state)
     else:
-        model.save_pretrained(checkpoint_dir)
+        if fsdp_state is None:
+            base.save_pretrained(checkpoint_dir)
+        else:
+            base.save_pretrained(checkpoint_dir, state_dict=fsdp_state)
 
 
 def assert_checkpoint_adapter_layout(checkpoint_dir: Path, cfg: dict[str, Any]) -> None:
@@ -1279,12 +1326,17 @@ def save_checkpoint(
     scheduler: Any,
     state: dict[str, Any],
     resolved_config: dict[str, Any],
+    rank: int,
+    is_main: bool,
 ) -> None:
-    ensure_checkpoint_save_target_safe(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(capture_rng_state(), checkpoint_dir / f"rng_state.rank_{rank}.pt")
+    if not is_main:
+        return
     save_model_adapters(transformer, checkpoint_dir, state["config"])
     torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
     torch.save(scheduler.state_dict(), checkpoint_dir / "scheduler.pt")
+    # Retain the historical rank-0 filename for older resume tooling.
     torch.save(capture_rng_state(), checkpoint_dir / "rng_state.pt")
     write_json(checkpoint_dir / "trainer_state.json", state)
     write_yaml(checkpoint_dir / "config_resolved.yaml", resolved_config)
@@ -1329,6 +1381,7 @@ def train(args: argparse.Namespace) -> None:
         log(f"  architecture={cfg['architecture']}")
         log(f"  distributed_strategy={cfg['distributed_strategy']}")
         log(f"  backward_mode={cfg['backward_mode']}")
+        log(f"  pair_score_mode={cfg['pair_score_mode']}")
         log(f"  wan_task_key={cfg['wan_task_key']}")
         log(f"  image-conditioned branch={cfg['task'] == 'i2v'}")
         log(f"  dual_expert={is_dual_expert(cfg)}")
@@ -1345,8 +1398,12 @@ def train(args: argparse.Namespace) -> None:
         log(f"  learning_rate={cfg['learning_rate']}")
         log(f"  max_steps={cfg['max_steps']}")
         effective_batch = int(cfg["batch_size"]) * int(cfg["accumulate_grad_batches"]) * int(dist_state["world_size"])
+        run_end_step = int(args.stop_after_step or cfg["max_steps"])
+        if run_end_step > int(cfg["max_steps"]):
+            raise ValueError("--stop-after-step cannot exceed max_train_steps")
         log(f"  effective_global_pair_batch={effective_batch}")
         log(f"  effective_global_batch_size={effective_batch}")
+        log(f"  run_end_step={run_end_step}")
         if resume_checkpoint is not None:
             log(f"  resume_checkpoint={resume_checkpoint}")
             resume_files = validate_checkpoint_manifest(resume_checkpoint)
@@ -1360,6 +1417,8 @@ def train(args: argparse.Namespace) -> None:
             resume_step = validate_resume_metadata(resume_checkpoint, resume_trainer_state, resume_scheduler_state)
             if resume_step >= int(cfg["max_steps"]):
                 raise ResumeError(f"Checkpoint step {resume_step} is already >= max_steps {cfg['max_steps']}")
+            if resume_step >= run_end_step:
+                raise ResumeError(f"Checkpoint step {resume_step} is already >= run_end_step {run_end_step}")
             resume_report.update(
                 {
                     "checkpoint": str(resume_checkpoint),
@@ -1404,13 +1463,6 @@ def train(args: argparse.Namespace) -> None:
         if use_fsdp:
             if not dist_state["distributed"]:
                 raise ValueError("fsdp_full_shard requires torchrun with world_size > 1")
-            if not args.memory_probe or not args.skip_checkpoint:
-                raise ValueError(
-                    "fsdp_full_shard is currently gated to --memory-probe --skip-checkpoint; "
-                    "formal checkpoint/resume support must be validated before training"
-                )
-            if resume_checkpoint is not None:
-                raise ValueError("FSDP memory gate does not accept resume checkpoints")
         load_device = torch.device("cpu") if use_fsdp else device
         transformer = build_policy_model(model_path, cfg, lora_config, load_device)
         record_memory("policy_loaded")
@@ -1489,7 +1541,10 @@ def train(args: argparse.Namespace) -> None:
         if resume_files is not None:
             cursor = compute_resume_data_cursor(step, accum_steps, len(dataloader))
             data_iter, data_epoch = make_data_iterator_at_cursor(dataloader, sampler, cursor)
-            rng_report = restore_rng_state_if_present(resume_files["rng_state"])
+            rank_rng_path = resume_checkpoint / f"rng_state.rank_{dist_state['rank']}.pt"
+            rng_report = restore_rng_state_if_present(
+                rank_rng_path if rank_rng_path.is_file() else resume_files["rng_state"]
+            )
             resume_report["data_cursor"] = cursor
             resume_report["rng"] = rng_report
             resume_report["first_new_update_step"] = step + 1
@@ -1521,7 +1576,7 @@ def train(args: argparse.Namespace) -> None:
                 data_iter = iter(dataloader)
                 return next(data_iter)
 
-        while step < int(cfg["max_steps"]):
+        while step < run_end_step:
             step_start = time.time()
             optimizer_lr_before_step = float(optimizer.param_groups[0]["lr"])
             optimizer.zero_grad(set_to_none=True)
@@ -1590,16 +1645,17 @@ def train(args: argparse.Namespace) -> None:
                 metrics.append(row)
                 print(json.dumps(row, ensure_ascii=False))
             should_save = not args.skip_checkpoint and (
-                step % int(cfg["save_steps"]) == 0 or step == int(cfg["max_steps"])
+                step % int(cfg["save_steps"]) == 0 or step == run_end_step
             )
             if should_save:
                 checkpoint_path = checkpoint_root / f"step_{step:06d}"
-                ensure_checkpoint_save_target_safe(checkpoint_path)
+                if is_main:
+                    ensure_checkpoint_save_target_safe(checkpoint_path)
                 distributed_barrier(dist_state)
-            if is_main and should_save:
+            if should_save:
                 save_checkpoint(
                     checkpoint_path,
-                    unwrap_model(transformer),
+                    transformer,
                     optimizer,
                     scheduler,
                     {
@@ -1613,6 +1669,8 @@ def train(args: argparse.Namespace) -> None:
                         "effective_global_batch_size": effective_batch,
                     },
                     cfg_all,
+                    rank=int(dist_state["rank"]),
+                    is_main=is_main,
                 )
             distributed_barrier(dist_state)
 
@@ -1697,6 +1755,7 @@ def train(args: argparse.Namespace) -> None:
                 "reference_mode": cfg["reference_mode"],
                 "distributed_strategy": cfg["distributed_strategy"],
                 "backward_mode": cfg["backward_mode"],
+                "pair_score_mode": cfg["pair_score_mode"],
                 "timestep_mode": cfg["timestep_mode"],
                 "training_shift": cfg["shift"],
                 "memory_trace": str(memory_trace_path) if args.memory_probe else None,
@@ -1705,6 +1764,8 @@ def train(args: argparse.Namespace) -> None:
                 "effective_global_pair_batch": effective_batch,
                 "effective_global_batch_size": effective_batch,
                 "steps": step,
+                "planned_max_steps": int(cfg["max_steps"]),
+                "stopped_at_requested_step": step < int(cfg["max_steps"]),
                 "checkpoint_path": str(final_ckpt) if final_ckpt is not None else None,
                 "checkpoint_reloaded": final_ckpt is not None,
                 "lora_delta_l1": lora_delta,
@@ -1753,6 +1814,13 @@ def main() -> None:
         choices=("joint", "sequential_recompute"),
         default=None,
     )
+    parser.add_argument(
+        "--pair-score-mode",
+        choices=("separate", "stacked"),
+        default=None,
+    )
+    parser.add_argument("--save-steps", type=int, default=None)
+    parser.add_argument("--stop-after-step", type=int, default=None)
     parser.add_argument(
         "--skip-checkpoint",
         action="store_true",

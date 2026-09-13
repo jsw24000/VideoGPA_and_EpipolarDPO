@@ -84,6 +84,9 @@ def base_training_config() -> dict[str, object]:
         "num_train_timesteps": 1000,
         "shift": 5.0,
         "gradient_clip_val": 1.0,
+        "distributed_strategy": "ddp",
+        "backward_mode": "joint",
+        "pair_score_mode": "separate",
     }
 
 
@@ -128,6 +131,24 @@ def test_validate_checkpoint_manifest_accepts_single_expert_adapter(tmp_path: Pa
 
     (checkpoint / expert / "adapter_config.json").unlink()
     with pytest.raises(FileNotFoundError, match=f"{expert}.adapter_config"):
+        validate_checkpoint_manifest(checkpoint)
+
+
+def test_fsdp_checkpoint_requires_every_rank_rng_state(tmp_path: Path) -> None:
+    checkpoint = make_single_expert_checkpoint(tmp_path, "high_noise_model")
+    config = {**base_training_config(), "distributed_strategy": "fsdp_full_shard"}
+    with (checkpoint / "config_resolved.yaml").open("w", encoding="utf-8") as handle:
+        yaml.safe_dump({"training_resolved": config}, handle)
+    write_file(
+        checkpoint / "trainer_state.json",
+        '{"step": 5000, "distributed": {"world_size": 8}}',
+    )
+    for rank in range(8):
+        write_file(checkpoint / f"rng_state.rank_{rank}.pt")
+    validate_checkpoint_manifest(checkpoint)
+
+    (checkpoint / "rng_state.rank_6.pt").unlink()
+    with pytest.raises(FileNotFoundError, match="per-rank RNG"):
         validate_checkpoint_manifest(checkpoint)
 
 

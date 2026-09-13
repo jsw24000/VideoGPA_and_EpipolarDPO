@@ -34,6 +34,9 @@ STRICT_TRAINING_KEYS = (
     "expert_mode",
     "reference_mode",
     "timestep_mode",
+    "distributed_strategy",
+    "backward_mode",
+    "pair_score_mode",
 )
 
 PATH_FIELDS_ALLOWED_TO_DRIFT = (
@@ -172,6 +175,23 @@ def validate_checkpoint_manifest(checkpoint_dir: str | Path) -> dict[str, Path |
             missing.append(label)
     if missing:
         raise FileNotFoundError(f"Checkpoint {root} is missing required file(s): {', '.join(missing)}")
+
+    config_payload = read_yaml(Path(files["config_resolved"]))
+    training_config = normalize_training_config(config_payload)
+    if training_config.get("distributed_strategy") == "fsdp_full_shard":
+        trainer_payload = read_json(Path(files["trainer_state"]))
+        distributed = trainer_payload.get("distributed", {})
+        world_size = int(distributed.get("world_size", 0)) if isinstance(distributed, dict) else 0
+        missing_rng = [
+            str(root / f"rng_state.rank_{rank}.pt")
+            for rank in range(world_size)
+            if not (root / f"rng_state.rank_{rank}.pt").is_file()
+        ]
+        if world_size < 2 or missing_rng:
+            raise FileNotFoundError(
+                f"FSDP checkpoint {root} has invalid per-rank RNG state: "
+                f"world_size={world_size}, missing={missing_rng}"
+            )
     files["present_experts"] = present_experts
     return files
 
@@ -225,6 +245,9 @@ def normalize_training_config(config: dict[str, Any]) -> dict[str, Any]:
     normalized.setdefault("expert_mode", "both")
     normalized.setdefault("reference_mode", "separate")
     normalized.setdefault("timestep_mode", "legacy_unshifted_model_input")
+    normalized.setdefault("distributed_strategy", "ddp")
+    normalized.setdefault("backward_mode", "joint")
+    normalized.setdefault("pair_score_mode", "separate")
     return normalized
 
 

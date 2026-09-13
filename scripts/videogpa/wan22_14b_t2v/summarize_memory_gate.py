@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,7 @@ def main() -> None:
         f"{training.get('distributed_strategy', probe_config.get('DISTRIBUTED_STRATEGY', 'unknown'))}"
     )
     print(f"backward_mode: {training.get('backward_mode', probe_config.get('BACKWARD_MODE', 'unknown'))}")
+    print(f"pair_score_mode: {training.get('pair_score_mode', probe_config.get('PAIR_SCORE_MODE', 'unknown'))}")
     print("rank memory:")
 
     minimum_headroom = float("inf")
@@ -77,10 +79,15 @@ def main() -> None:
             f"peak_reserved={peak_reserved:.2f}GB total={total:.2f}GB headroom={headroom:.2f}GB "
             f"last_label={rows[-1].get('label', 'unknown')}"
         )
+        completed = [row for row in rows if str(row.get("label", "")).endswith("_complete") and str(row.get("label", "")).startswith("step_")]
+        if len(completed) >= 2:
+            growth = float(completed[-1].get("allocated_gb", 0.0)) - float(completed[0].get("allocated_gb", 0.0))
+            print(f"    completed_step_allocated_growth={growth:+.3f}GB over {len(completed)} steps")
 
     metrics = training.get("metrics", [])
     if metrics:
         first = metrics[0]
+        last = metrics[-1]
         debug = first.get("debug_shapes", {})
         print(f"first_step_policy_reference_max_abs_diff: {first.get('policy_reference_max_abs_diff')}")
         print(
@@ -91,6 +98,26 @@ def main() -> None:
         print(f"first_step_time_sec: {first.get('step_time_sec')}")
         print(f"first_step_winner_recompute_max_abs_diff: {debug.get('winner_recompute_max_abs_diff')}")
         print(f"first_step_loser_recompute_max_abs_diff: {debug.get('loser_recompute_max_abs_diff')}")
+        step_times = [float(row["step_time_sec"]) for row in metrics if row.get("step_time_sec") is not None]
+        print(f"recorded_steps: {len(metrics)}")
+        if step_times:
+            print(
+                "step_time_sec: "
+                f"median={statistics.median(step_times):.3f} min={min(step_times):.3f} max={max(step_times):.3f}"
+            )
+        print(f"loss_first_last: {first.get('total_loss')} -> {last.get('total_loss')}")
+        print(f"grad_norm_first_last: {first.get('grad_norm')} -> {last.get('grad_norm')}")
+        recompute_diffs = [
+            float(value)
+            for row in metrics
+            for value in (
+                row.get("debug_shapes", {}).get("winner_recompute_max_abs_diff"),
+                row.get("debug_shapes", {}).get("loser_recompute_max_abs_diff"),
+            )
+            if value is not None
+        ]
+        if recompute_diffs:
+            print(f"maximum_recompute_max_abs_diff: {max(recompute_diffs)}")
 
     if not training:
         verdict = "FAILED_OR_INCOMPLETE: inspect logs/gate.log and the last memory trace label"
