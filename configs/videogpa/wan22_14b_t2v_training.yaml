@@ -1,0 +1,90 @@
+experiment:
+  name: wan22_14b_t2v_videogpa_training
+  output_subdir: videogpa/wan22_14b_t2v/training
+
+project:
+  method: videogpa
+  model_family: wan2.2
+  model_scale: 14b
+  task: t2v
+  run_type: formal_training
+
+paths:
+  videogpa_relpath: VideoGPA
+  wan_source_relpath: third_party/Wan2.2
+
+model:
+  model_relpath: wan/Wan2.2-T2V-A14B
+  vggt_model_relpath: vggt/VGGT-1B
+  wan_task_key: t2v-A14B
+  architecture: dual_expert_a14b
+  vae_version: wan2_1
+
+data:
+  manifest_relpath: manifests/videogpa_protocol/train_t2v.json
+  master_manifest_relpath: manifests/master_all.jsonl
+  first_frames_relroot: first_frames
+  required_split: train
+  required_buckets: [8k, 9k, 10k, 11k]
+  subset_size: all
+  subset_seed: 2026
+  candidates_per_prompt: 3
+  candidate_seeds: [1001, 1002, 1003]
+
+generation:
+  frame_num: 81
+  size: "832*480"
+  sampling_steps: 40
+  guide_scale: [3.0, 4.0]
+  sample_shift: 12.0
+  sample_solver: unipc
+  fps: 16
+
+scoring:
+  num_sampled_frames: 10
+  conf_threshold: 0
+  metric_name: consistency_score
+  metric_mode: min
+  motion_threshold: 0.001
+  min_score_gap: 0.05
+  winner_score_threshold: 0.8
+  smoke_fallback_if_no_pairs: false
+
+encoding:
+  dtype: bfloat16
+  overwrite: false
+  num_frames: 81
+
+training:
+  # 2101 pairs / global pair batch 16 gives about 132 updates per data epoch.
+  max_train_steps: 660
+  save_steps: 110
+  batch_size_per_gpu: 1
+  gradient_accumulation_steps: 2
+  learning_rate: 5.0e-6
+  warmup_steps: 33
+  lora_rank: 64
+  lora_alpha: 128.0
+  lora_dropout: 0.0
+  lora_target_modules: [q, k, v, o]
+  loss_strategy: dpo
+  dpo_beta: 1.0
+  seed: 2026
+  num_workers: 0
+  gradient_clip_val: 1.0
+  num_train_timesteps: 1000
+  shift: 5.0
+  expert_mode: high
+  reference_mode: shared_base
+  timestep_mode: shifted_scheduler
+  distributed_strategy: fsdp_full_shard
+  backward_mode: sequential_recompute
+  pair_score_mode: separate
+  enable_gradient_checkpointing: true
+  device: 0
+
+formal_requirements:
+  expected_encoded_pairs: 2101
+  expert_training: separate_high_low
+  effective_global_pair_batch: 16
+  planned_data_epochs: 5

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -106,6 +107,14 @@ DEFAULT_CONFIG = {
 def read_json(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def write_json(path: Path, data: Any) -> None:
@@ -243,6 +252,7 @@ def resolve_config(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "backward_mode": yaml_train.get("backward_mode", train_cfg["backward_mode"]),
             "pair_score_mode": yaml_train.get("pair_score_mode", train_cfg["pair_score_mode"]),
+            "expected_encoded_pairs": cfg.get("formal_requirements", {}).get("expected_encoded_pairs"),
         }
     )
     if "num_train_timesteps" not in yaml_train and hasattr(wan_cfg, "num_train_timesteps"):
@@ -718,6 +728,9 @@ def validate_encoded_conditions(run_dir: Path, metadata_path: Path, cfg: dict[st
     pairs = payload.get("pairs", [])
     if not pairs:
         raise ValueError("encoded manifest contains no pairs")
+    expected_pairs = cfg.get("expected_encoded_pairs")
+    if expected_pairs is not None and len(pairs) != int(expected_pairs):
+        raise ValueError(f"encoded pair count mismatch: expected={expected_pairs}, actual={len(pairs)}")
     task = str(cfg.get("task", "t2v"))
     architecture = str(cfg.get("architecture", "single_ti2v_5b"))
     for pair in pairs:
@@ -1354,6 +1367,7 @@ def train(args: argparse.Namespace) -> None:
         run_dir = Path(cfg_all["paths"]["run_dir"]).resolve()
         model_path = Path(cfg_all["paths"]["wan_model_path"]).resolve()
         metadata_path = Path(args.metadata_path or run_dir / "manifests/encoded_pairs.json").expanduser().resolve()
+        metadata_sha256 = sha256_file(metadata_path)
         output_dir = Path(args.output_dir or run_dir).expanduser().resolve()
         checkpoint_root = output_dir / "checkpoints"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1414,6 +1428,12 @@ def train(args: argparse.Namespace) -> None:
             resume_scheduler_state = torch_load(resume_files["scheduler"])
             assert isinstance(resume_trainer_state, dict)
             assert isinstance(resume_scheduler_state, dict)
+            checkpoint_metadata_sha256 = resume_trainer_state.get("metadata_sha256")
+            if checkpoint_metadata_sha256 != metadata_sha256:
+                raise ResumeError(
+                    "Encoded manifest hash mismatch: "
+                    f"checkpoint={checkpoint_metadata_sha256!r}, current={metadata_sha256!r}"
+                )
             resume_step = validate_resume_metadata(resume_checkpoint, resume_trainer_state, resume_scheduler_state)
             if resume_step >= int(cfg["max_steps"]):
                 raise ResumeError(f"Checkpoint step {resume_step} is already >= max_steps {cfg['max_steps']}")
@@ -1665,6 +1685,8 @@ def train(args: argparse.Namespace) -> None:
                         "metrics": metrics,
                         "trainable_stats": stats,
                         "distributed": dist_state,
+                        "metadata_path": str(metadata_path),
+                        "metadata_sha256": metadata_sha256,
                         "effective_global_pair_batch": effective_batch,
                         "effective_global_batch_size": effective_batch,
                     },
@@ -1756,6 +1778,8 @@ def train(args: argparse.Namespace) -> None:
                 "distributed_strategy": cfg["distributed_strategy"],
                 "backward_mode": cfg["backward_mode"],
                 "pair_score_mode": cfg["pair_score_mode"],
+                "metadata_path": str(metadata_path),
+                "metadata_sha256": metadata_sha256,
                 "timestep_mode": cfg["timestep_mode"],
                 "training_shift": cfg["shift"],
                 "memory_trace": str(memory_trace_path) if args.memory_probe else None,

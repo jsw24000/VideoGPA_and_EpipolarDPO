@@ -6,13 +6,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../../env/require_profile.sh"
 vgm_require_profile
 
-CONFIG="${CONFIG:-${VGM_REPO_ROOT}/configs/videogpa/wan22_14b_t2v_formal.yaml}"
+CONFIG="${CONFIG:-${VGM_REPO_ROOT}/configs/videogpa/wan22_14b_t2v_training.yaml}"
 SOURCE_RUN_DIR="${SOURCE_RUN_DIR:?SOURCE_RUN_DIR must contain the completed encoded A14B pairs}"
 OUTPUT_DIR="${OUTPUT_DIR:?OUTPUT_DIR must be a new expert-specific training directory}"
 EXPERT_MODE="${EXPERT_MODE:?EXPERT_MODE must be high or low}"
 GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
-MAX_STEPS="${MAX_STEPS:-10000}"
-SAVE_STEPS="${SAVE_STEPS:-1000}"
+MAX_STEPS="${MAX_STEPS:-}"
+SAVE_STEPS="${SAVE_STEPS:-}"
 TRAINING_SHIFT="${TRAINING_SHIFT:-5.0}"
 PAIR_SCORE_MODE="${PAIR_SCORE_MODE:-separate}"
 RESUME="${RESUME:-0}"
@@ -56,9 +56,9 @@ ARGS=(
   --distributed-strategy fsdp_full_shard
   --backward-mode sequential_recompute
   --pair-score-mode "${PAIR_SCORE_MODE}"
-  --max_train_steps "${MAX_STEPS}"
-  --save-steps "${SAVE_STEPS}"
 )
+[[ -n "${MAX_STEPS}" ]] && ARGS+=(--max_train_steps "${MAX_STEPS}")
+[[ -n "${SAVE_STEPS}" ]] && ARGS+=(--save-steps "${SAVE_STEPS}")
 [[ "${RESUME}" == "1" ]] && ARGS+=(--resume)
 [[ "${MEMORY_PROBE}" == "1" ]] && ARGS+=(--memory-probe)
 [[ -n "${STOP_AFTER_STEP:-}" ]] && ARGS+=(--stop-after-step "${STOP_AFTER_STEP}")

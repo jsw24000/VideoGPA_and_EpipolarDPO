@@ -8,6 +8,7 @@ TRAINER = REPO_ROOT / "VideoGPA" / "train" / "Wan2.2-T2V-5B" / "03_train.py"
 LAUNCHER = REPO_ROOT / "scripts" / "videogpa" / "wan22_14b_t2v" / "run_memory_gate.sh"
 SUMMARIZER = REPO_ROOT / "scripts" / "videogpa" / "wan22_14b_t2v" / "summarize_memory_gate.py"
 EXPERT_LAUNCHER = REPO_ROOT / "scripts" / "videogpa" / "wan22_14b_t2v" / "run_expert_training.sh"
+TRAINING_CONFIG = REPO_ROOT / "configs" / "videogpa" / "wan22_14b_t2v_training.yaml"
 
 
 def test_trainer_exposes_memory_safe_a14b_gate_modes() -> None:
@@ -31,6 +32,8 @@ def test_trainer_exposes_memory_safe_a14b_gate_modes() -> None:
     assert "dist.all_reduce(param.grad" in source
     assert "fsdp_lora_state_dict" in source
     assert 'rng_state.rank_{rank}.pt' in source
+    assert "Encoded manifest hash mismatch" in source
+    assert "encoded pair count mismatch" in source
     assert 'memory_callback("policy_winner_backward_complete")' in source
     assert 'memory_callback("policy_loser_backward_complete")' in source
     assert "torch.autograd.grad(loss_out.loss" in source
@@ -79,3 +82,18 @@ def test_expert_launcher_isolated_fsdp_training_contract() -> None:
     assert "--reference-mode shared_base" in source
     assert "--timestep-mode shifted_scheduler" in source
     assert 'ARGS+=(--resume)' in source
+    assert "wan22_14b_t2v_training.yaml" in source
+    assert 'MAX_STEPS="${MAX_STEPS:-}"' in source
+
+
+def test_a14b_training_config_records_validated_strategy() -> None:
+    source = TRAINING_CONFIG.read_text(encoding="utf-8")
+    assert "max_train_steps: 660" in source
+    assert "save_steps: 110" in source
+    assert "warmup_steps: 33" in source
+    assert "shift: 5.0" in source
+    assert "reference_mode: shared_base" in source
+    assert "timestep_mode: shifted_scheduler" in source
+    assert "distributed_strategy: fsdp_full_shard" in source
+    assert "backward_mode: sequential_recompute" in source
+    assert "pair_score_mode: separate" in source
