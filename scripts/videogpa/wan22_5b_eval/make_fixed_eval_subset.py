@@ -9,6 +9,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from make_eval_manifest import build_manifest, read_jsonl, sha256_file, sha256_text, write_json
 from vgm_common.paths import ensure_profile, get_manifest_root
 
@@ -175,6 +177,20 @@ def build_fixed_subset(args: argparse.Namespace) -> dict[str, Any]:
         "selected_source_indices": [int(sample["index"]) for sample in selected_samples],
     }
     payload["generation_settings"] = dict(full["generation_settings"])
+    if args.generation_config:
+        config_path = Path(args.generation_config).expanduser().resolve(strict=True)
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        generation = config.get("generation")
+        if not isinstance(generation, dict):
+            raise ValueError(f"Config has no generation mapping: {config_path}")
+        required = ("frame_num", "size", "sampling_steps", "sample_shift", "guide_scale", "sample_solver", "fps")
+        missing = [key for key in required if key not in generation]
+        if missing:
+            raise ValueError(f"Generation config is missing: {', '.join(missing)}")
+        payload["generation_settings"].update({key: generation[key] for key in required})
+        payload["generation_settings"]["source_config_filename"] = config_path.name
+        payload["generation_settings"]["source_config_sha256"] = sha256_file(config_path)
+        payload["generation_settings"]["lora_weight_primary"] = float(args.lora_weight)
     payload["generation_settings"].update(
         {
             "seed_policy": "per_prompt_seed",
@@ -195,6 +211,8 @@ def main() -> None:
     parser.add_argument("--source-seed", type=int, default=DEFAULT_SAMPLING_SEED)
     parser.add_argument("--per-prompt-seed-base", type=int, default=DEFAULT_PER_PROMPT_SEED_BASE)
     parser.add_argument("--caption-length-bins", type=int, default=4)
+    parser.add_argument("--generation-config", default=None)
+    parser.add_argument("--lora-weight", type=float, default=1.0)
     args = parser.parse_args()
 
     output = Path(args.output).expanduser().resolve()

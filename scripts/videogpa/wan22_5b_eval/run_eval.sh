@@ -18,6 +18,7 @@ GPU_ID="${GPU_ID:-0}"
 GPU_IDS="${GPU_IDS:-${GPU_ID}}"
 SCORE_DEVICES="${SCORE_DEVICES:-${GPU_IDS}}"
 EVAL_VARIANT="${EVAL_VARIANT:-${EVAL_LORA_VARIANT:-}}"
+A14B_PARALLEL_MODE="${A14B_PARALLEL_MODE:-distributed}"
 RUN_BASELINE="${EVAL_RUN_BASELINE:-1}"
 BASELINE_ONLY=0
 SKIP_GENERATION=0
@@ -180,11 +181,6 @@ case "${PER_SAMPLE_SEEDS}" in
     exit 2
     ;;
 esac
-if [[ "${EVAL_VARIANT}" == *,* ]]; then
-  printf 'Only one fine-tuned variant is allowed per RUN_DIR; got: %s\n' "${EVAL_VARIANT}" >&2
-  exit 2
-fi
-
 mkdir -p "${MANIFEST_DIR}" "${GEN_DIR}" "${SCORE_DIR}" "${LOG_DIR}" "${CONFIG_DIR}"
 
 adapter_complete() {
@@ -242,6 +238,7 @@ fi
   printf 'PER_SAMPLE_SEEDS=%s\n' "${PER_SAMPLE_SEEDS}"
   printf 'GPU_IDS=%s\n' "${GPU_IDS}"
   printf 'SCORE_DEVICES=%s\n' "${SCORE_DEVICES}"
+  printf 'A14B_PARALLEL_MODE=%s\n' "${A14B_PARALLEL_MODE}"
   printf 'RUN_BASELINE=%s\n' "${RUN_BASELINE}"
   printf 'BASELINE_ONLY=%s\n' "${BASELINE_ONLY}"
   printf 'EVAL_VARIANT=%s\n' "${EVAL_VARIANT}"
@@ -350,8 +347,22 @@ variant_names() {
     printf 'baseline\n'
   fi
   if [[ "${BASELINE_ONLY}" != "1" && -n "${EVAL_VARIANT}" ]]; then
-    printf '%s\n' "${EVAL_VARIANT%%=*}"
+    local spec
+    while IFS= read -r spec; do
+      printf '%s\n' "${spec%%=*}"
+    done < <(printf '%s\n' "${EVAL_VARIANT}" | tr ',' '\n')
   fi
+}
+
+variant_spec() {
+  local name="$1"
+  local spec
+  while IFS= read -r spec; do
+    if [[ "${spec%%=*}" == "${name}" ]]; then
+      printf '%s\n' "${spec}"
+      return
+    fi
+  done < <(printf '%s\n' "${EVAL_VARIANT}" | tr ',' '\n')
 }
 
 variant_lora_path() {
@@ -359,7 +370,9 @@ variant_lora_path() {
   if [[ "${name}" == "baseline" || -z "${EVAL_VARIANT}" ]]; then
     return
   fi
-  local rhs="${EVAL_VARIANT#*=}"
+  local spec
+  spec="$(variant_spec "${name}")"
+  local rhs="${spec#*=}"
   if [[ "${rhs}" == *:* ]]; then
     printf '%s\n' "${rhs%:*}"
   else
@@ -372,7 +385,9 @@ variant_lora_weight() {
   if [[ "${name}" == "baseline" || -z "${EVAL_VARIANT}" ]]; then
     return
   fi
-  local rhs="${EVAL_VARIANT#*=}"
+  local spec
+  spec="$(variant_spec "${name}")"
+  local rhs="${spec#*=}"
   if [[ "${rhs}" == *:* ]]; then
     printf '%s\n' "${rhs##*:}"
   else
@@ -493,34 +508,90 @@ generate_variant() {
   IFS=',' read -r -a gpu_list <<< "${GPU_IDS}"
   if [[ "${is_a14b}" == "1" ]]; then
     if (( ${#gpu_list[@]} > 1 )); then
-      local extra_args=()
-      if [[ "${DIT_FSDP:-1}" == "1" ]]; then
-        extra_args+=(--dit_fsdp)
-      fi
-      if [[ "${T5_FSDP:-1}" == "1" ]]; then
-        extra_args+=(--t5_fsdp)
-      fi
-      if [[ "${USE_SP:-1}" == "1" ]]; then
-        extra_args+=(--ulysses_size "${ULYSSES_SIZE:-${#gpu_list[@]}}")
-      fi
-      printf '[run_eval] distributed A14B generation for %s: GPU_IDS=%s DIT_FSDP=%s T5_FSDP=%s USE_SP=%s ULYSSES_SIZE=%s\n' \
-        "${variant}" "${GPU_IDS}" "${DIT_FSDP:-1}" "${T5_FSDP:-1}" "${USE_SP:-1}" "${ULYSSES_SIZE:-${#gpu_list[@]}}"
-      CUDA_VISIBLE_DEVICES="${GPU_IDS}" "${PY_CMD[@]}" -m torch.distributed.run \
-        --standalone \
-        --nnodes=1 \
-        --nproc_per_node="${#gpu_list[@]}" \
-        "${generator}" \
-        --config "${config}" \
-        --run-dir "${EVAL_DIR}" \
-        --input_json "${TASK_MANIFEST_PATH}" \
-        --output_dir "${out_dir}" \
-        --candidate_groups_json "${MANIFEST_DIR}/${variant}.candidate_groups.json" \
-        --gpu_id 0 \
-        "${seed_args[@]}" \
-        --candidates_per_prompt 1 \
-        "${extra_args[@]}" \
-        "${lora_args[@]}" \
-        "${force_args[@]}" 2>&1 | tee "${LOG_DIR}/generate_${variant}.log"
+      case "${A14B_PARALLEL_MODE}" in
+        throughput)
+          if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+            printf '[run_eval] CUDA_VISIBLE_DEVICES=%s is set; unset it before physical-GPU A14B throughput generation.\n' "${CUDA_VISIBLE_DEVICES}" >&2
+            exit 2
+          fi
+          local shard_manifests=()
+          local pids=()
+          local shard_index gpu shard_manifest shard_log
+          for shard_index in "${!gpu_list[@]}"; do
+            gpu="${gpu_list[${shard_index}]}"
+            shard_manifest="${MANIFEST_DIR}/${variant}.shard_${shard_index}.json"
+            shard_log="${LOG_DIR}/generate_${variant}.shard_${shard_index}.log"
+            shard_manifests+=("${shard_manifest}")
+            printf '[run_eval] generate A14B %s shard %s/%s on GPU %s\n' \
+              "${variant}" "${shard_index}" "${#gpu_list[@]}" "${gpu}"
+            (
+              CUDA_VISIBLE_DEVICES="${gpu}" PYTHONUNBUFFERED=1 "${PY_CMD[@]}" "${generator}" \
+                --config "${config}" \
+                --run-dir "${EVAL_DIR}" \
+                --input_json "${TASK_MANIFEST_PATH}" \
+                --output_dir "${out_dir}" \
+                --candidate_groups_json "${shard_manifest}" \
+                --gpu_id 0 \
+                "${seed_args[@]}" \
+                --candidates_per_prompt 1 \
+                --shard_index "${shard_index}" \
+                --num_shards "${#gpu_list[@]}" \
+                "${lora_args[@]}" \
+                "${force_args[@]}"
+            ) >"${shard_log}" 2>&1 &
+            pids+=("$!")
+          done
+          local status=0 pid
+          for pid in "${pids[@]}"; do
+            if ! wait "${pid}"; then
+              status=1
+            fi
+          done
+          if [[ "${status}" != "0" ]]; then
+            printf '[run_eval] A14B throughput generation failed for %s; see %s/generate_%s.shard_*.log\n' \
+              "${variant}" "${LOG_DIR}" "${variant}" >&2
+            exit "${status}"
+          fi
+          "${PY_CMD[@]}" "${T2V_SCRIPT_DIR}/merge_shards.py" groups \
+            --output "${MANIFEST_DIR}/${variant}.candidate_groups.json" \
+            --order-json "${TASK_MANIFEST_PATH}" \
+            "${shard_manifests[@]}"
+          ;;
+        distributed)
+          local extra_args=()
+          if [[ "${DIT_FSDP:-1}" == "1" ]]; then
+            extra_args+=(--dit_fsdp)
+          fi
+          if [[ "${T5_FSDP:-1}" == "1" ]]; then
+            extra_args+=(--t5_fsdp)
+          fi
+          if [[ "${USE_SP:-1}" == "1" ]]; then
+            extra_args+=(--ulysses_size "${ULYSSES_SIZE:-${#gpu_list[@]}}")
+          fi
+          printf '[run_eval] distributed A14B generation for %s: GPU_IDS=%s DIT_FSDP=%s T5_FSDP=%s USE_SP=%s ULYSSES_SIZE=%s\n' \
+            "${variant}" "${GPU_IDS}" "${DIT_FSDP:-1}" "${T5_FSDP:-1}" "${USE_SP:-1}" "${ULYSSES_SIZE:-${#gpu_list[@]}}"
+          CUDA_VISIBLE_DEVICES="${GPU_IDS}" "${PY_CMD[@]}" -m torch.distributed.run \
+            --standalone \
+            --nnodes=1 \
+            --nproc_per_node="${#gpu_list[@]}" \
+            "${generator}" \
+            --config "${config}" \
+            --run-dir "${EVAL_DIR}" \
+            --input_json "${TASK_MANIFEST_PATH}" \
+            --output_dir "${out_dir}" \
+            --candidate_groups_json "${MANIFEST_DIR}/${variant}.candidate_groups.json" \
+            --gpu_id 0 \
+            "${seed_args[@]}" \
+            --candidates_per_prompt 1 \
+            "${extra_args[@]}" \
+            "${lora_args[@]}" \
+            "${force_args[@]}" 2>&1 | tee "${LOG_DIR}/generate_${variant}.log"
+          ;;
+        *)
+          printf 'A14B_PARALLEL_MODE must be distributed or throughput, got %s\n' "${A14B_PARALLEL_MODE}" >&2
+          exit 2
+          ;;
+      esac
     else
       "${PY_CMD[@]}" "${generator}" \
         --config "${config}" \
@@ -635,16 +706,24 @@ if [[ "${RUN_BASELINE}" != "1" && "${BASELINE_ONLY}" == "1" ]]; then
   printf -- '--baseline-only cannot be combined with --skip-baseline.\n' >&2
   exit 2
 fi
-if [[ -n "${EVAL_VARIANT}" && "${EVAL_VARIANT}" != *=* ]]; then
-  printf 'Invalid --variant; expected NAME=CHECKPOINT_PATH[:WEIGHT], got %s\n' "${EVAL_VARIANT}" >&2
-  exit 2
-fi
 if [[ -n "${EVAL_VARIANT}" ]]; then
-  VARIANT_NAME="${EVAL_VARIANT%%=*}"
-  if [[ ! "${VARIANT_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || "${VARIANT_NAME}" == "baseline" ]]; then
-    printf 'Invalid variant name %s; use letters, digits, dot, underscore, or hyphen, and do not use baseline.\n' "${VARIANT_NAME}" >&2
-    exit 2
-  fi
+  declare -A SEEN_VARIANTS=()
+  while IFS= read -r spec; do
+    if [[ "${spec}" != *=* ]]; then
+      printf 'Invalid --variant entry; expected NAME=CHECKPOINT_PATH[:WEIGHT], got %s\n' "${spec}" >&2
+      exit 2
+    fi
+    VARIANT_NAME="${spec%%=*}"
+    if [[ ! "${VARIANT_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || "${VARIANT_NAME}" == "baseline" ]]; then
+      printf 'Invalid variant name %s; use letters, digits, dot, underscore, or hyphen, and do not use baseline.\n' "${VARIANT_NAME}" >&2
+      exit 2
+    fi
+    if [[ -n "${SEEN_VARIANTS[${VARIANT_NAME}]:-}" ]]; then
+      printf 'Duplicate variant name: %s\n' "${VARIANT_NAME}" >&2
+      exit 2
+    fi
+    SEEN_VARIANTS["${VARIANT_NAME}"]=1
+  done < <(printf '%s\n' "${EVAL_VARIANT}" | tr ',' '\n')
 fi
 
 if [[ "${SKIP_GENERATION}" != "1" ]]; then

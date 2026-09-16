@@ -63,6 +63,16 @@ def test_a14b_eval_multigpu_defaults_enable_sequence_parallel() -> None:
     assert "--ulysses_size" in launcher
 
 
+def test_a14b_eval_supports_independent_throughput_shards() -> None:
+    launcher = (REPO_ROOT / "scripts/videogpa/wan22_5b_eval/run_eval.sh").read_text(encoding="utf-8")
+
+    assert 'A14B_PARALLEL_MODE="${A14B_PARALLEL_MODE:-distributed}"' in launcher
+    assert "generate A14B %s shard" in launcher
+    assert '--shard_index "${shard_index}"' in launcher
+    assert '--num_shards "${#gpu_list[@]}"' in launcher
+    assert "A14B throughput generation failed" in launcher
+
+
 def test_a14b_generator_accepts_fixed_eval_sample_seeds() -> None:
     entrypoint = (REPO_ROOT / "VideoGPA/generate/Wan2.2-A14B.py").read_text(encoding="utf-8")
 

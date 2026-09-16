@@ -73,4 +73,53 @@ for f in "${RUN_DIR}"/logs/generation.shard_*.log; do
 done
 ```
 
+## Evaluate separately trained high/low experts
+
+Separate expert checkpoints are not directly loadable by the A14B generator. Pair matching
+high/low checkpoints into provenance-recorded symlink bundles first. The command validates
+the step, encoded-pair SHA256, training configuration, adapter configuration, and weight files;
+it refuses to replace an existing bundle.
+
+```bash
+python scripts/videogpa/wan22_14b_t2v/prepare_dual_adapter_eval.py \
+  --high-run "$HIGH_RUN" \
+  --low-run "$LOW_RUN" \
+  --output-root "$BUNDLE_ROOT" \
+  --steps 110 220 330
+```
+
+Build one immutable held-out manifest. Use the same file and per-prompt seeds for every
+baseline/checkpoint variant.
+
+```bash
+test ! -e "$FIXED_MANIFEST"
+mkdir -p "$(dirname "$FIXED_MANIFEST")"
+python scripts/videogpa/wan22_5b_eval/make_fixed_eval_subset.py \
+  --output "$FIXED_MANIFEST" \
+  --limit 32 \
+  --sampling-seed 456 \
+  --generation-config configs/videogpa/wan22_14b_t2v_formal.yaml \
+  --lora-weight 1.0
+```
+
+Run baseline plus all paired checkpoints with one independent process per 80GB GPU. Use
+LoRA weight `1.0`; the adapter configuration already contains its training-time scaling.
+
+```bash
+unset CUDA_VISIBLE_DEVICES
+GPU_IDS=0,1,2,3,4,5,6,7 \
+SCORE_DEVICES=0,1,2,3,4,5,6,7 \
+A14B_PARALLEL_MODE=throughput \
+bash scripts/videogpa/wan22_5b_eval/run_eval.sh \
+  --run-dir "$SOURCE_RUN_DIR" \
+  --task t2v \
+  --eval-name videogpa_ckpt_selection_fixed32_seed456 \
+  --eval-manifest "$FIXED_MANIFEST" \
+  --per-sample-seeds \
+  --variants "videogpa_step110=$BUNDLE_ROOT/step_000110:1.0,videogpa_step220=$BUNDLE_ROOT/step_000220:1.0,videogpa_step330=$BUNDLE_ROOT/step_000330:1.0"
+```
+
+The evaluation directory is resumable. Existing complete videos and score markers are reused;
+do not pass `--force-generation` during normal recovery.
+
 To measure four-worker contention, compare one fresh single-GPU micro run against a fresh four-GPU throughput micro run with the same resolution, frame count, steps, prompt, and seed. Do not reuse an output directory containing valid MP4s because generation will skip them. During each run capture GPU, CPU, and storage pressure with `nvidia-smi dmon -s pucm -d 5`, `pidstat -rud -h 5`, and `iostat -xz 5`. A single worker near 12 minutes versus four workers near 14.5 minutes indicates shared CPU memory, PCIe, or storage contention of about 20%; the new transfer and save timings show which one.

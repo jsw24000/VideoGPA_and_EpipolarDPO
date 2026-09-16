@@ -162,6 +162,29 @@ def test_fixed_500_eval_subset_has_stable_prompt_ids_and_per_prompt_seeds(tmp_pa
     assert not [text for text in iter_strings(payload) if text.startswith("/")]
 
 
+def test_fixed_eval_subset_can_record_a14b_generation_protocol(tmp_path: Path) -> None:
+    out = tmp_path / "wan22_a14b_fixed8.json"
+    config = REPO_ROOT / "configs/videogpa/wan22_14b_t2v_formal.yaml"
+    command = (
+        "source scripts/env/activate_profile.sh local >/dev/null && "
+        "python scripts/videogpa/wan22_5b_eval/make_fixed_eval_subset.py "
+        f"--output {out} --limit 8 --sampling-seed 456 --generation-config {config} --lora-weight 1.0"
+    )
+    proc = run_bash(command)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    settings = json.loads(out.read_text(encoding="utf-8"))["generation_settings"]
+    assert settings["size"] == "832*480"
+    assert settings["frame_num"] == 81
+    assert settings["sampling_steps"] == 40
+    assert settings["sample_shift"] == 12.0
+    assert settings["guide_scale"] == [3.0, 4.0]
+    assert settings["fps"] == 16
+    assert settings["lora_weight_primary"] == 1.0
+    assert settings["source_config_filename"] == config.name
+    assert len(settings["source_config_sha256"]) == 64
+
+
 def test_task_manifest_preserves_fixed_prompt_seed_metadata(tmp_path: Path) -> None:
     canonical = tmp_path / "fixed.json"
     i2v_out = tmp_path / "i2v_fixed.json"
@@ -298,7 +321,8 @@ def test_eval_runner_manifest_only_uses_flat_100_sample_layout(tmp_path: Path) -
     assert "--per-sample-seeds" in runner
     assert "--use_sample_seeds" in runner
     assert '[[ -f "${adapter_dir}/adapter_model.safetensors" || -f "${adapter_dir}/adapter_model.bin" ]]' in runner
-    assert "Only one fine-tuned variant is allowed per RUN_DIR" in runner
+    assert "Duplicate variant name" in runner
+    assert "tr ',' '\\n'" in runner
 
 
 def test_eval_runner_discovers_inference_complete_legacy_checkpoint(tmp_path: Path) -> None:
@@ -324,6 +348,25 @@ def test_eval_runner_discovers_inference_complete_legacy_checkpoint(tmp_path: Pa
         run_dir / "evaluation/dl3dv1k_seed456/config/environment.txt"
     ).read_text(encoding="utf-8")
     assert f"EVAL_VARIANT=videogpa_step_010000={checkpoint}:0.2" in environment
+
+
+def test_eval_runner_accepts_multiple_named_variants(tmp_path: Path) -> None:
+    run_dir = tmp_path / "wan22_14b_t2v_formal_001"
+    run_dir.mkdir()
+    (run_dir / "config_resolved.yaml").write_text(
+        "project:\n  method: videogpa\n  model_scale: 14b\n  task: t2v\n",
+        encoding="utf-8",
+    )
+    variants = "step110=/tmp/step110:1.0,step330=/tmp/step330:1.0"
+    command = (
+        "source scripts/env/activate_profile.sh local >/dev/null && "
+        f"PYTHON_BIN=python bash scripts/videogpa/wan22_5b_eval/run_eval.sh --run-dir {run_dir} "
+        f"--variants {variants} --skip-baseline --skip-generation --skip-score"
+    )
+    proc = run_bash(command)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    environment = (run_dir / "evaluation/dl3dv1k_seed456/config/environment.txt").read_text(encoding="utf-8")
+    assert f"EVAL_VARIANT={variants}" in environment
 
 
 def test_t2v_generator_marks_1k_dict_manifest_as_test(monkeypatch, tmp_path: Path) -> None:

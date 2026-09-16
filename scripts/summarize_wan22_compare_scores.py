@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+import random
 from collections import defaultdict
 from pathlib import Path
 
@@ -38,6 +39,26 @@ def mean(values):
     return None if not values else sum(values) / len(values)
 
 
+def percentile(values, probability):
+    ordered = sorted(values)
+    if not ordered:
+        return None
+    position = probability * (len(ordered) - 1)
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] * (1 - fraction) + ordered[upper] * fraction
+
+
+def bootstrap_mean_ci(values, *, samples, seed):
+    if not values:
+        return None, None
+    rng = random.Random(seed)
+    count = len(values)
+    boot = [sum(rng.choice(values) for _ in range(count)) / count for _ in range(samples)]
+    return percentile(boot, 0.025), percentile(boot, 0.975)
+
+
 def collect_by_prompt(rows, metric):
     out = {}
     grouped = defaultdict(list)
@@ -61,7 +82,11 @@ def main():
     parser.add_argument("--lora_csv", required=True)
     parser.add_argument("--output_csv", required=True)
     parser.add_argument("--output_md", required=True)
+    parser.add_argument("--bootstrap_samples", type=int, default=10000)
+    parser.add_argument("--bootstrap_seed", type=int, default=2026)
     args = parser.parse_args()
+    if args.bootstrap_samples <= 0:
+        raise ValueError("--bootstrap_samples must be positive")
 
     baseline_rows = load_rows(args.baseline_csv)
     lora_rows = load_rows(args.lora_csv)
@@ -82,13 +107,24 @@ def main():
             if base_value is not None and lora_value is not None:
                 paired_diffs.append(lora_value - base_value)
         paired_diff = mean(paired_diffs)
+        ci_low, ci_high = bootstrap_mean_ci(
+            paired_diffs,
+            samples=args.bootstrap_samples,
+            seed=args.bootstrap_seed,
+        )
 
         if direction == "higher":
             improvement = None if paired_diff is None else paired_diff > 0
+            wins = sum(value > 0 for value in paired_diffs)
         elif direction == "lower":
             improvement = None if paired_diff is None else paired_diff < 0
+            wins = sum(value < 0 for value in paired_diffs)
         else:
             improvement = None
+            wins = 0
+        ties = sum(value == 0 for value in paired_diffs)
+        win_rate = None if direction == "report" or not paired_diffs else wins / len(paired_diffs)
+        tie_rate = None if direction == "report" or not paired_diffs else ties / len(paired_diffs)
 
         summary_rows.append(
             {
@@ -99,6 +135,10 @@ def main():
                 "mean_diff_lora_minus_baseline": diff,
                 "paired_prompt_count": len(paired_diffs),
                 "paired_mean_diff_lora_minus_baseline": paired_diff,
+                "paired_mean_diff_ci95_low": ci_low,
+                "paired_mean_diff_ci95_high": ci_high,
+                "paired_win_rate": win_rate,
+                "paired_tie_rate": tie_rate,
                 "paired_improved": "" if improvement is None else str(improvement).lower(),
             }
         )
@@ -119,18 +159,23 @@ def main():
         f"- Baseline videos: {len(baseline_rows)}",
         f"- LoRA videos: {len(lora_rows)}",
         "",
-        "| Metric | Direction | Baseline Mean | LoRA Mean | Paired Diff | Improved |",
-        "|---|---:|---:|---:|---:|---:|",
+        f"- Paired bootstrap: {args.bootstrap_samples} resamples, seed {args.bootstrap_seed}",
+        "",
+        "| Metric | Direction | Baseline Mean | LoRA Mean | Paired Diff | 95% CI | Win Rate | Tie Rate |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in summary_rows:
         lines.append(
-            "| {metric} | {direction} | {baseline} | {lora} | {paired} | {improved} |".format(
+            "| {metric} | {direction} | {baseline} | {lora} | {paired} | [{ci_low}, {ci_high}] | {win_rate} | {tie_rate} |".format(
                 metric=row["metric"],
                 direction=row["direction"],
                 baseline=format_value(row["baseline_mean"]),
                 lora=format_value(row["lora_mean"]),
                 paired=format_value(row["paired_mean_diff_lora_minus_baseline"]),
-                improved=row["paired_improved"],
+                ci_low=format_value(row["paired_mean_diff_ci95_low"]),
+                ci_high=format_value(row["paired_mean_diff_ci95_high"]),
+                win_rate=format_value(row["paired_win_rate"]),
+                tie_rate=format_value(row["paired_tie_rate"]),
             )
         )
     output_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
