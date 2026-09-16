@@ -25,6 +25,7 @@ def make_checkpoint(
     mode: str,
     metadata_sha: str = "abc",
     rank: int = 64,
+    target_modules: list[str] | None = None,
 ) -> Path:
     expert = f"{mode}_noise_model"
     checkpoint = run / "checkpoints" / f"step_{step:06d}"
@@ -36,7 +37,7 @@ def make_checkpoint(
                 "base_model_name_or_path": f"/models/{mode}_noise_model",
                 "r": rank,
                 "lora_alpha": 128,
-                "target_modules": ["q", "k", "v", "o"],
+                "target_modules": target_modules or ["q", "k", "v", "o"],
             }
         ),
         encoding="utf-8",
@@ -124,3 +125,28 @@ def test_validate_pair_rejects_incompatible_adapter_rank(tmp_path: Path) -> None
 
     with pytest.raises(ValueError, match="adapter configuration mismatch"):
         module.validate_pair(high, low, 220)
+
+
+def test_validate_pair_accepts_different_target_module_order(tmp_path: Path) -> None:
+    module = load_module()
+    high_run = tmp_path / "high"
+    low_run = tmp_path / "low"
+    make_checkpoint(high_run, 110, "high", target_modules=["q", "k", "v", "o"])
+    make_checkpoint(low_run, 110, "low", target_modules=["o", "v", "k", "q"])
+    high = module.checkpoint_for(high_run, 110, "high")
+    low = module.checkpoint_for(low_run, 110, "low")
+
+    module.validate_pair(high, low, 110)
+
+
+def test_validate_pair_rejects_different_target_module_members(tmp_path: Path) -> None:
+    module = load_module()
+    high_run = tmp_path / "high"
+    low_run = tmp_path / "low"
+    make_checkpoint(high_run, 110, "high", target_modules=["q", "k", "v", "o"])
+    make_checkpoint(low_run, 110, "low", target_modules=["q", "k", "v"])
+    high = module.checkpoint_for(high_run, 110, "high")
+    low = module.checkpoint_for(low_run, 110, "low")
+
+    with pytest.raises(ValueError, match="target_modules"):
+        module.validate_pair(high, low, 110)

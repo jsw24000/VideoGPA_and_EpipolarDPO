@@ -40,6 +40,7 @@ ADAPTER_COMPATIBILITY_KEYS = (
     "alpha_pattern",
     "modules_to_save",
 )
+ORDER_INSENSITIVE_ADAPTER_KEYS = {"target_modules", "modules_to_save"}
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -55,6 +56,12 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def normalized_adapter_value(key: str, value: Any) -> Any:
+    if key in ORDER_INSENSITIVE_ADAPTER_KEYS and isinstance(value, (list, tuple, set)):
+        return sorted(value)
+    return value
 
 
 def adapter_files(adapter_dir: Path) -> tuple[Path, Path]:
@@ -114,7 +121,8 @@ def validate_pair(high: dict[str, Any], low: dict[str, Any], step: int) -> None:
     adapter_mismatches = [
         key
         for key in ADAPTER_COMPATIBILITY_KEYS
-        if high_adapter.get(key) != low_adapter.get(key)
+        if normalized_adapter_value(key, high_adapter.get(key))
+        != normalized_adapter_value(key, low_adapter.get(key))
     ]
     if adapter_mismatches:
         raise ValueError(
