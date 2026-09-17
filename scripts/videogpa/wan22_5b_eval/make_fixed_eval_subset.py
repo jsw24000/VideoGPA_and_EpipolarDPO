@@ -112,15 +112,53 @@ def add_fixed_eval_fields(
     return updated
 
 
+def load_exclusions(paths: list[str]) -> tuple[set[int], list[dict[str, Any]]]:
+    excluded: set[int] = set()
+    records = []
+    for raw_path in paths:
+        path = Path(raw_path).expanduser().resolve(strict=True)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        samples = payload.get("samples")
+        if not isinstance(samples, list):
+            raise ValueError(f"Exclusion manifest has no samples list: {path}")
+        indices = set()
+        for sample in samples:
+            if not isinstance(sample, dict) or "index" not in sample:
+                raise ValueError(f"Exclusion manifest sample is missing index: {path}")
+            indices.add(int(sample["index"]))
+        excluded.update(indices)
+        records.append(
+            {
+                "filename": path.name,
+                "sha256": sha256_file(path),
+                "excluded_source_indices": len(indices),
+            }
+        )
+    return excluded, records
+
+
 def build_fixed_subset(args: argparse.Namespace) -> dict[str, Any]:
     ensure_profile()
     source_args = argparse.Namespace(seed=args.source_seed, limit="all")
     full = build_manifest(source_args)
     samples = list(full["samples"])
+    excluded_indices, exclusion_records = load_exclusions(args.exclude_manifest)
+    source_indices = {int(sample["index"]) for sample in samples}
+    unknown_exclusions = excluded_indices - source_indices
+    if unknown_exclusions:
+        preview = sorted(unknown_exclusions)[:10]
+        raise ValueError(f"Exclusion manifest contains source indices outside this protocol: {preview}")
+    available_positions = [
+        position for position, sample in enumerate(samples) if int(sample["index"]) not in excluded_indices
+    ]
+    available_position_set = set(available_positions)
     if args.limit <= 0:
         raise ValueError("--limit must be positive")
-    if args.limit > len(samples):
-        raise ValueError(f"--limit={args.limit} exceeds source samples={len(samples)}")
+    if args.limit > len(available_positions):
+        raise ValueError(
+            f"--limit={args.limit} exceeds eligible source samples={len(available_positions)} "
+            f"after excluding {len(excluded_indices)} indices"
+        )
 
     manifest_root = get_manifest_root()
     master_rows = read_jsonl(manifest_root / "master_test.jsonl")
@@ -135,10 +173,13 @@ def build_fixed_subset(args: argparse.Namespace) -> dict[str, Any]:
         word_count = len(str(master_row.get("vlm_caption") or sample["text_prompt"]).split())
         length_bin = caption_length_bin(word_count, bounds)
         key = f"motion={motion_family(master_row.get('scripted_camera_motion'))}|caption_len_bin={length_bin}"
-        strata[key].append(position)
         sample_meta[position] = (master_row, word_count, length_bin)
+        if position in available_position_set:
+            strata[key].append(position)
 
-    selected_positions = select_stratified_indices(strata, args.limit, args.sampling_seed, len(samples))
+    selected_positions = select_stratified_indices(
+        strata, args.limit, args.sampling_seed, len(available_positions)
+    )
     selected_samples = []
     for position in selected_positions:
         master_row, word_count, length_bin = sample_meta[position]
@@ -169,6 +210,9 @@ def build_fixed_subset(args: argparse.Namespace) -> dict[str, Any]:
         "requested_limit": int(args.limit),
         "source_protocol": full["protocol"],
         "source_size": len(samples),
+        "eligible_source_size": len(available_positions),
+        "excluded_source_indices": len(excluded_indices),
+        "exclusion_manifests": exclusion_records,
         "stratify_by": ["scripted_camera_motion_family", "caption_length_bin"],
         "caption_length_bins": int(args.caption_length_bins),
         "caption_length_bounds": bounds,
@@ -213,6 +257,7 @@ def main() -> None:
     parser.add_argument("--caption-length-bins", type=int, default=4)
     parser.add_argument("--generation-config", default=None)
     parser.add_argument("--lora-weight", type=float, default=1.0)
+    parser.add_argument("--exclude-manifest", action="append", default=[])
     args = parser.parse_args()
 
     output = Path(args.output).expanduser().resolve()

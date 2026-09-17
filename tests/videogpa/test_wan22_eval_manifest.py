@@ -185,6 +185,29 @@ def test_fixed_eval_subset_can_record_a14b_generation_protocol(tmp_path: Path) -
     assert len(settings["source_config_sha256"]) == 64
 
 
+def test_fixed_eval_subset_can_exclude_checkpoint_selection_manifest(tmp_path: Path) -> None:
+    selection = tmp_path / "selection.json"
+    confirmation = tmp_path / "confirmation.json"
+    command = (
+        "source scripts/env/activate_profile.sh local >/dev/null && "
+        "python scripts/videogpa/wan22_5b_eval/make_fixed_eval_subset.py "
+        f"--output {selection} --limit 32 --sampling-seed 456 && "
+        "python scripts/videogpa/wan22_5b_eval/make_fixed_eval_subset.py "
+        f"--output {confirmation} --limit 100 --sampling-seed 789 --exclude-manifest {selection}"
+    )
+    proc = run_bash(command)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    selected = json.loads(selection.read_text(encoding="utf-8"))
+    confirmed = json.loads(confirmation.read_text(encoding="utf-8"))
+    selected_indices = {sample["index"] for sample in selected["samples"]}
+    confirmed_indices = {sample["index"] for sample in confirmed["samples"]}
+    assert selected_indices.isdisjoint(confirmed_indices)
+    assert confirmed["selection"]["eligible_source_size"] == 968
+    assert confirmed["selection"]["excluded_source_indices"] == 32
+    assert confirmed["selection"]["exclusion_manifests"][0]["sha256"]
+
+
 def test_task_manifest_preserves_fixed_prompt_seed_metadata(tmp_path: Path) -> None:
     canonical = tmp_path / "fixed.json"
     i2v_out = tmp_path / "i2v_fixed.json"
